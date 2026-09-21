@@ -13,6 +13,7 @@ BANNER = "=" * 60
 HELP_TEXT = """\
 📖 可用指令：
    /reload  重新加载内核与安全模块（保留对话上下文与 shell 会话）
+   /clear   清空对话上下文（仅保留系统提示词）
    /help    显示本帮助
    exit/q   退出
 
@@ -101,7 +102,7 @@ def _read_input(prompt: str) -> str:
 def print_banner(assistant) -> None:
     print(BANNER)
     print("🚀 个人专属智能助手已启动！")
-    print("   指令: /reload 热重载代码(保留上下文) | /help 帮助 | exit/q 退出")
+    print("   指令: /reload 热重载代码(保留上下文) | /clear 清空上下文 | /help 帮助 | exit/q 退出")
     print("   输入: Enter 提交 | Alt+Enter 换行 | Esc 中断操作 | ←→ 移动光标")
     print(f"📦 已激活技能库: {list(assistant.tools_registry.keys())}")
     print(BANNER)
@@ -124,6 +125,10 @@ def run_repl(assistant) -> None:
                 break
             if user_prompt.lower() in ["/reload", "/r"]:
                 print("\n" + assistant.reload_code())
+                continue
+            if user_prompt.lower() in ["/clear", "/c"]:
+                assistant.memory.clear()
+                print("\n🧹 已清空对话上下文，仅保留系统提示词。")
                 continue
             if user_prompt.lower() in ["/help", "/h"]:
                 print("\n" + HELP_TEXT)

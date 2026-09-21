@@ -26,6 +26,10 @@ class ConversationMemory:
         elif self.messages[0].content != self.system_prompt:
             self.messages[0] = SystemMessage(content=self.system_prompt)
 
+    def clear(self) -> None:
+        """清空对话上下文，仅保留系统提示词（首条 system 消息）。"""
+        self.messages = [SystemMessage(content=self.system_prompt)]
+
     def add_user(self, content: str) -> None:
         self.messages.append(HumanMessage(content=content))
 
