@@ -31,8 +31,9 @@ if SKILLS_DIR not in sys.path:
 
 # 热重载时需要原地刷新的模块（顺序：被依赖者在前）
 RELOADABLE_MODULES = [
-    "security.policy",
-    "security",
+    # 注意：security 相关模块【故意】不在热重载名单内。
+    # 安全策略只在进程冷启动时加载，任何修改都必须由用户显式重启进程才生效，
+    # 防止 Agent 通过 reload_self 自行放宽/绕过自身的安全约束。
     "runtime.bash",
     "tools.builtin",
     "core.prompts",
@@ -163,7 +164,8 @@ class InteractiveAssistant:
         ✅ 适用场景（推荐使用热重载，秒级生效）：
           - 纯逻辑修复：修改方法体内部代码、调整 Prompt 模版、优化异常处理与日志。
           - 工具增删改：新增/移除 Tool、修改现有 Tool 的执行逻辑或入参描述。
-          - 规则配置更新：更新 security/ 中的安全策略、命令过滤规则、黑白名单。
+          - 规则配置更新：更新 core/ 中的提示词、工具描述等。
+            ⚠️ security/ 下的安全策略【不参与热重载】，修改后必须冷重启进程才生效。
           - 新增普通方法：类中新增的方法随原型链立即生效。
 
         ❌ 不支持 / 存在风险（必须进行完整冷重启进程）：
