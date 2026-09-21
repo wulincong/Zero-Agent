@@ -2,7 +2,7 @@
 
 输入采用 prompt_toolkit（若可用），提供完整行编辑能力：
 - 左右方向键移动光标、Home/End、Ctrl+A/E、Ctrl+W 删词、历史上下翻；
-- 多行输入：Alt+Enter（或 Esc 后 Enter、Ctrl+J）插入换行，Enter 提交；
+- 多行输入：Alt+Enter（或 Esc 后 Enter）插入换行，Enter 提交；
 - Ctrl+C 清空当前输入行（不退出），Ctrl+D 空行时退出。
 若 prompt_toolkit 不可用或非 TTY 环境，自动降级为内置 input()（仅单行）。
 """
@@ -18,9 +18,7 @@ HELP_TEXT = """\
 
 ⌨️  输入技巧：
    Enter          提交
-   Shift+Enter    换行（多行输入，VS Code 终端支持）
-   Alt+Enter      换行（备用；部分终端为 Esc 后按 Enter）
-   Ctrl+J         换行（备用）
+   Alt+Enter      换行（多行输入；部分终端为 Esc 后按 Enter）
    ← → / Home/End 移动光标
    ↑ ↓            翻阅历史
    Esc            中断当前操作（模型调用/命令执行），回到对话
@@ -58,15 +56,10 @@ def _build_session():
         """插入换行，实现多行输入。"""
         event.app.current_buffer.insert_text("\n")
 
-    # Shift+Enter：终端需支持扩展键盘协议（VS Code 终端支持）。
-    # VS Code 发送 CSI u 格式：ESC [ 1 3 ; 2 u
-    # 注意：旧式 modifyOtherKeys 序列 ESC[27;2;13~ 已被 prompt_toolkit
-    # 内置映射为 ControlM（等同 Enter），无法在此层区分，故不绑定。
-    kb.add("escape", "[", "1", "3", ";", "2", "u")(_newline)
-
-    # 兜底：Alt+Enter / Esc 后 Enter / Ctrl+J 同样换行
+    # 换行：仅保留 Alt+Enter（部分终端为 Esc 后按 Enter）。
+    # 说明：Shift+Enter 在 VS Code 终端会直接触发提交、Ctrl+J 与 VS Code 冲突，
+    # 故均不绑定，避免误提交/冲突。
     kb.add("escape", "enter")(_newline)
-    kb.add("c-j")(_newline)
 
     @kb.add("c-c")
     def _(event):
@@ -109,7 +102,7 @@ def print_banner(assistant) -> None:
     print(BANNER)
     print("🚀 个人专属智能助手已启动！")
     print("   指令: /reload 热重载代码(保留上下文) | /help 帮助 | exit/q 退出")
-    print("   输入: Enter 提交 | Shift+Enter 换行 | Esc 中断操作 | ←→ 移动光标")
+    print("   输入: Enter 提交 | Alt+Enter 换行 | Esc 中断操作 | ←→ 移动光标")
     print(f"📦 已激活技能库: {list(assistant.tools_registry.keys())}")
     print(BANNER)
 
