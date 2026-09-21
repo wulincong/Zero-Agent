@@ -15,8 +15,10 @@ def make_bash_tool(bash):
     @tool
     def run_bash(command: str) -> str:
         """在持久终端中执行 Bash 命令。环境变量和目录切换全生命周期保持生效。"""
+        from runtime.interrupt import get_interrupt
+
         print(f"\n💻 [Shell]: {command}")
-        out = bash.run(command)
+        out = bash.run(command, interrupt=get_interrupt())
         print(f"📄 [Output]:\n{out}")
         return out
 

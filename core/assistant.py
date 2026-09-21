@@ -14,6 +14,10 @@ import sys
 from langchain_core.messages import SystemMessage
 
 from core.prompts import SYSTEM_PROMPT
+
+
+class _Interrupted(Exception):
+    """内部信号：表示用户中断了当前操作。"""
 from memory import ConversationMemory
 from models import DEFAULT_BASE_URL, build_model
 from runtime import PersistentBash
@@ -29,6 +33,8 @@ if SKILLS_DIR not in sys.path:
 RELOADABLE_MODULES = [
     "security.policy",
     "security",
+    "runtime.bash",
+    "tools.builtin",
     "core.prompts",
     "core.assistant",
 ]
@@ -72,7 +78,8 @@ class InteractiveAssistant:
         print(f"    命令: {cmd}")
         print("=" * 60)
         try:
-            ans = input("是否执行？[y/N] > ").strip().lower()
+            from cli.repl import _read_input
+            ans = _read_input("是否执行？[y/N] > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
         return ans in ("y", "yes")
@@ -214,43 +221,104 @@ class InteractiveAssistant:
     # 对话驱动
     # ------------------------------------------------------------------
     def chat(self, user_input: str) -> str:
-        """多轮对话单步驱动器"""
+        """多轮对话单步驱动器（支持 Esc 中断）。"""
         # 兜底：确保系统提示词始终位于对话历史首位（热重载/异常后自愈）
         self.memory.ensure_system_prompt()
 
         from langchain_core.messages import ToolMessage
 
+        from runtime.interrupt import get_interrupt
+
+        ctrl = get_interrupt()
+        ctrl.clear()
+
+        # 记录本轮起始位置，便于中断时回滚，保证历史一致
+        start_len = len(self.memory)
         self.memory.add_user(user_input)
 
-        while True:
-            try:
-                ai_msg = self.model.invoke(self.memory.messages)
-            except Exception as e:
-                return f"❌ 模型调用失败: {e}"
+        ctrl.start()  # 启动 Esc 监听（仅 TTY 下生效）
+        try:
+            while True:
+                # ---- 模型调用（流式，便于及时响应中断）----
+                try:
+                    ai_msg = self._stream_model(ctrl)
+                except _Interrupted:
+                    self._rollback(start_len)
+                    return "⏹️ 已中断（模型调用阶段）。已回到对话。"
+                except Exception as e:
+                    self._rollback(start_len)
+                    return f"❌ 模型调用失败: {e}"
 
-            self.memory.add(ai_msg)
+                if ai_msg is None:  # 被中断
+                    self._rollback(start_len)
+                    return "⏹️ 已中断（模型调用阶段）。已回到对话。"
 
-            if not ai_msg.tool_calls:
-                return ai_msg.content
+                self.memory.add(ai_msg)
 
-            for call in ai_msg.tool_calls:
-                fn_name = call["name"]
-                fn_args = call["args"]
+                if not ai_msg.tool_calls:
+                    return ai_msg.content
 
-                target_tool = self.tools_registry.get(fn_name)
-                if not target_tool:
-                    res = f"Error: 未找到工具 {fn_name}"
-                else:
-                    if fn_name not in ["run_bash", "install_skill"]:
-                        print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
-                    try:
-                        res = target_tool.invoke(fn_args)
-                    except Exception as e:
-                        # 工具异常不中断对话，回填给模型让它自行纠错
-                        res = f"Error: 工具 {fn_name} 执行失败: {type(e).__name__}: {e}"
-                        print(f"⚠️ [工具异常]: {res}")
+                # ---- 工具执行 ----
+                for call in ai_msg.tool_calls:
+                    if ctrl.is_set():
+                        self._rollback(start_len)
+                        return "⏹️ 已中断（工具执行阶段）。已回到对话。"
 
-                self.memory.add(ToolMessage(
-                    content=str(res),
-                    tool_call_id=call["id"]
-                ))
+                    fn_name = call["name"]
+                    fn_args = call["args"]
+
+                    target_tool = self.tools_registry.get(fn_name)
+                    if not target_tool:
+                        res = f"Error: 未找到工具 {fn_name}"
+                    else:
+                        if fn_name not in ["run_bash", "install_skill"]:
+                            print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
+                        try:
+                            res = self._invoke_tool(target_tool, fn_args, ctrl)
+                        except _Interrupted:
+                            self._rollback(start_len)
+                            return "⏹️ 已中断（工具执行阶段）。已回到对话。"
+                        except Exception as e:
+                            # 工具异常不中断对话，回填给模型让它自行纠错
+                            res = f"Error: 工具 {fn_name} 执行失败: {type(e).__name__}: {e}"
+                            print(f"⚠️ [工具异常]: {res}")
+
+                    self.memory.add(ToolMessage(
+                        content=str(res),
+                        tool_call_id=call["id"]
+                    ))
+        finally:
+            ctrl.stop()
+
+    def _stream_model(self, ctrl):
+        """流式调用模型并聚合为完整 AIMessage；中断时返回 None。
+
+        流式的好处：每收到一个 chunk 就检查一次中断标志，
+        用户按 Esc 后能在极短时间内停止等待。
+        """
+        from langchain_core.messages import AIMessageChunk
+
+        aggregated = None
+        try:
+            for chunk in self.model.stream(self.memory.messages):
+                if ctrl.is_set():
+                    return None
+                aggregated = chunk if aggregated is None else aggregated + chunk
+        except Exception:
+            # 流式失败时回退到一次性调用（保证兼容性）
+            if ctrl.is_set():
+                return None
+            return self.model.invoke(self.memory.messages)
+
+        if aggregated is None:
+            return self.model.invoke(self.memory.messages)
+        # 聚合结果已是 AIMessageChunk，转换为 AIMessage 语义一致
+        return aggregated
+
+    def _invoke_tool(self, target_tool, fn_args, ctrl):
+        """执行工具。run_bash 内部通过全局中断控制器实现命令级中断。"""
+        return target_tool.invoke(fn_args)
+
+    def _rollback(self, start_len: int) -> None:
+        """回滚本轮对话产生的消息，保证历史一致（不残留残缺 tool_call）。"""
+        del self.memory.messages[start_len:]

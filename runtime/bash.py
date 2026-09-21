@@ -9,14 +9,16 @@
 
 import os
 import select
+import signal
 import subprocess
 import time
 import uuid
 
+from runtime.interrupt import get_interrupt
 from security import Decision, check_command
 
 # 单条命令的默认超时（秒）
-DEFAULT_TIMEOUT = 60
+DEFAULT_TIMEOUT = 180
 
 
 class PersistentBash:
@@ -53,7 +55,7 @@ class PersistentBash:
             return buf
         return buf + data.decode("utf-8", errors="replace")
 
-    def run(self, cmd: str, timeout: float = DEFAULT_TIMEOUT) -> str:
+    def run(self, cmd: str, timeout: float = DEFAULT_TIMEOUT, interrupt=None) -> str:
         # ---- 第一层：命令准入 ----
         verdict = check_command(cmd)
         if verdict.decision is Decision.DENY:
@@ -81,11 +83,21 @@ class PersistentBash:
             return f"Error: 无法写入 bash 进程: {e}"
 
         timed_out = False
+        interrupted = False
+        ctrl = interrupt if interrupt is not None else get_interrupt()
         deadline = time.monotonic() + timeout
         while True:
             remaining = deadline - time.monotonic()
             if remaining <= 0:
                 timed_out = True
+                break
+            # 用户按 Esc：向 bash 子进程发送 SIGINT，打断当前前台命令
+            if ctrl.is_set():
+                interrupted = True
+                self._send_sigint()
+                # 给子进程一点时间响应，再收集残留输出
+                time.sleep(0.1)
+                self._drain_available()
                 break
             r, _, _ = select.select([self._out_fd, self._err_fd], [], [], min(0.05, remaining))
             if self._out_fd in r:
@@ -101,6 +113,11 @@ class PersistentBash:
         self._err_buf = ""
         if err:
             out = (out + "\n" + err).strip() if out else err
+        if interrupted:
+            # 中断后命令可能仍在运行，为保持会话干净，重启 bash。
+            self._restart()
+            out += "\n[已中断] 用户按 Esc 中止了该命令，shell 会话已重置。"
+            return out
         if timed_out:
             # 挂起的命令仍在占用 stdin/stdout，会污染后续命令。
             # 直接重启 bash 会话，保证后续命令干净可用（代价是丢失 cd/env 状态）。
@@ -110,6 +127,24 @@ class PersistentBash:
                 f"（如交互式命令）。已返回当前已捕获的输出，并已重置 shell 会话。"
             )
         return out
+
+    def _send_sigint(self) -> None:
+        """向 bash 子进程发送 SIGINT，打断其前台命令。"""
+        try:
+            self.proc.send_signal(signal.SIGINT)
+        except Exception:
+            pass
+
+    def _drain_available(self) -> None:
+        """非阻塞地收集当前所有可用输出。"""
+        for _ in range(5):
+            r, _, _ = select.select([self._out_fd, self._err_fd], [], [], 0.02)
+            if not r:
+                break
+            if self._out_fd in r:
+                self._out_buf = self._drain(self._out_fd, self._out_buf)
+            if self._err_fd in r:
+                self._err_buf = self._drain(self._err_fd, self._err_buf)
 
     def _restart(self):
         """重启 bash 会话，清理挂起命令造成的状态污染。"""

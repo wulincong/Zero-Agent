@@ -8,7 +8,6 @@ from security.policy import (
     Decision,
     Verdict,
     check_command,
-    is_sensitive_path,
 )
 
-__all__ = ["Decision", "Verdict", "check_command", "is_sensitive_path"]
+__all__ = ["Decision", "Verdict", "check_command"]
