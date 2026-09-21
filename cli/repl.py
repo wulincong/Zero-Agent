@@ -22,25 +22,53 @@ except Exception:  # pragma: no cover - 环境缺失时降级
 
 _CONSOLE = None
 
+# 渲染宽度上限：避免 Markdown（尤其表格/段落）铺满整个终端。
+# 可用环境变量 AGENT_RENDER_WIDTH 覆盖；设为 0 表示不限制（用终端全宽）。
+_DEFAULT_MAX_WIDTH = 100
+
+
+def _resolve_width() -> int | None:
+    """计算渲染宽度：min(终端宽度, 上限)。返回 None 表示不限制。"""
+    import os
+    import shutil
+
+    raw = os.environ.get("AGENT_RENDER_WIDTH")
+    if raw is not None:
+        try:
+            limit = int(raw)
+        except ValueError:
+            limit = _DEFAULT_MAX_WIDTH
+        if limit <= 0:
+            return None
+    else:
+        limit = _DEFAULT_MAX_WIDTH
+
+    term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
+    return min(term_cols, limit)
+
 
 def _get_console():
-    """惰性构造 rich Console（仅在 TTY 下启用渲染）。"""
+    """惰性构造 rich Console（仅在 TTY 下启用渲染），并限制渲染宽度。"""
     global _CONSOLE
     if _CONSOLE is None:
-        _CONSOLE = Console()
+        _CONSOLE = Console(width=_resolve_width())
     return _CONSOLE
 
 
-def render_markdown(text: str, prefix: str = "\n🤖 Agent > ") -> None:
-    """将模型输出的 Markdown 渲染后打印；非 TTY 或 rich 不可用时降级为纯文本。"""
+def render_markdown(text: str, prefix: str = "🤖 Agent > ") -> None:
+    """将模型输出的 Markdown 渲染后打印；非 TTY 或 rich 不可用时降级为纯文本。
+
+    前缀单独成行打印，保证与正文之间有换行。
+    """
     if not text:
         return
     if _HAS_RICH and sys.stdout.isatty():
         console = _get_console()
-        console.print(prefix, end="", highlight=False)
+        console.print()  # 空行：与上一段输出分隔
+        console.print(prefix, highlight=False)
         console.print(Markdown(text))
     else:
-        print(f"{prefix}{text}")
+        print(f"\n{prefix}\n{text}")
 
 
 BANNER = "=" * 60
