@@ -9,6 +9,40 @@
 
 import sys
 
+# ----------------------------------------------------------------------
+# 输出后端：优先 rich 渲染 Markdown，失败则降级为纯文本
+# ----------------------------------------------------------------------
+try:
+    from rich.console import Console
+    from rich.markdown import Markdown
+
+    _HAS_RICH = True
+except Exception:  # pragma: no cover - 环境缺失时降级
+    _HAS_RICH = False
+
+_CONSOLE = None
+
+
+def _get_console():
+    """惰性构造 rich Console（仅在 TTY 下启用渲染）。"""
+    global _CONSOLE
+    if _CONSOLE is None:
+        _CONSOLE = Console()
+    return _CONSOLE
+
+
+def render_markdown(text: str, prefix: str = "\n🤖 Agent > ") -> None:
+    """将模型输出的 Markdown 渲染后打印；非 TTY 或 rich 不可用时降级为纯文本。"""
+    if not text:
+        return
+    if _HAS_RICH and sys.stdout.isatty():
+        console = _get_console()
+        console.print(prefix, end="", highlight=False)
+        console.print(Markdown(text))
+    else:
+        print(f"{prefix}{text}")
+
+
 BANNER = "=" * 60
 HELP_TEXT = """\
 📖 可用指令：
@@ -134,7 +168,7 @@ def run_repl(assistant) -> None:
                 print("\n" + HELP_TEXT)
                 continue
             response = assistant.chat(user_prompt)
-            print(f"\n🤖 Agent > {response}")
+            render_markdown(response)
 
             if getattr(assistant, "_pending_reload", False):
                 print("\n" + assistant.reload_code())
