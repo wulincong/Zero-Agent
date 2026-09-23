@@ -71,6 +71,20 @@ def render_markdown(text: str, prefix: str = "🤖 Agent > ") -> None:
         print(f"\n{prefix}\n{text}")
 
 
+def make_tool_call_printer():
+    """构造工具调用流式提示回调。
+
+    模型刚决定调用工具时打印工具名；参数聚合完成后打印完整参数。
+    返回的回调签名：on_tool_call(name, args=None)。
+    """
+    def on_tool_call(name: str, args=None) -> None:
+        if args is None:
+            print(f"\n🔧 调用工具: {name}", flush=True)
+        else:
+            print(f"   参数: {args}", flush=True)
+    return on_tool_call
+
+
 BANNER = "=" * 60
 HELP_TEXT = """\
 📖 可用指令：
@@ -195,7 +209,9 @@ def run_repl(assistant) -> None:
             if user_prompt.lower() in ["/help", "/h"]:
                 print("\n" + HELP_TEXT)
                 continue
-            response = assistant.chat(user_prompt)
+            response = assistant.chat(
+                user_prompt, on_tool_call=make_tool_call_printer()
+            )
             render_markdown(response)
 
             if getattr(assistant, "_pending_reload", False):

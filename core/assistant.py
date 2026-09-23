@@ -231,8 +231,15 @@ class InteractiveAssistant:
     # ------------------------------------------------------------------
     # 对话驱动
     # ------------------------------------------------------------------
-    def chat(self, user_input: str) -> str:
-        """多轮对话单步驱动器（支持 Esc 中断）。"""
+    def chat(self, user_input: str, on_tool_call=None) -> str:
+        """多轮对话单步驱动器（支持 Esc 中断）。
+
+        Args:
+            on_tool_call: 可选回调，用于工具调用流式提示。
+                签名 on_tool_call(name, args=None)：
+                - 模型刚决定调用工具时，以 (name, None) 调用（参数尚未生成）；
+                - 参数聚合完成后，以 (name, args) 再次调用。
+        """
         # 兜底：确保系统提示词始终位于对话历史首位（热重载/异常后自愈）
         self.memory.ensure_system_prompt()
 
@@ -252,7 +259,7 @@ class InteractiveAssistant:
             while True:
                 # ---- 模型调用（流式，便于及时响应中断）----
                 try:
-                    ai_msg = self._stream_model(ctrl)
+                    ai_msg = self._stream_model(ctrl, on_tool_call=on_tool_call)
                 except _Interrupted:
                     self._rollback(start_len)
                     return "⏹️ 已中断（模型调用阶段）。已回到对话。"
@@ -278,6 +285,10 @@ class InteractiveAssistant:
                     fn_name = call["name"]
                     fn_args = call["args"]
 
+                    # 参数已聚合完成，通知回调显示完整参数（工具名此前已流式提示过）
+                    if on_tool_call:
+                        on_tool_call(fn_name, fn_args)
+
                     target_tool = self.tools_registry.get(fn_name)
                     if not target_tool:
                         res = f"Error: 未找到工具 {fn_name}"
@@ -301,11 +312,16 @@ class InteractiveAssistant:
         finally:
             ctrl.stop()
 
-    def _stream_model(self, ctrl):
+    def _stream_model(self, ctrl, on_tool_call=None):
         """流式调用模型并聚合为完整 AIMessage；中断时返回 None。
 
         流式的好处：每收到一个 chunk 就检查一次中断标志，
         用户按 Esc 后能在极短时间内停止等待。
+
+        Args:
+            on_tool_call: 可选回调 on_tool_call(name, args=None)。
+                当模型开始生成工具调用时，以 (name, None) 实时通知，
+                便于 CLI 在模型"刚决定调用工具"时就给出提示。
         """
         from langchain_core.messages import AIMessageChunk
 
@@ -314,6 +330,11 @@ class InteractiveAssistant:
             for chunk in self.model.stream(self.memory.messages):
                 if ctrl.is_set():
                     return None
+                # 工具调用流式：工具名一出现就通知（参数逐字符生成，此处不通知）
+                if on_tool_call and getattr(chunk, "tool_call_chunks", None):
+                    for tc in chunk.tool_call_chunks:
+                        if tc.get("name"):
+                            on_tool_call(tc["name"])
                 aggregated = chunk if aggregated is None else aggregated + chunk
         except Exception as e:
             # 中断优先：用户已按 Esc 时直接返回，不再重发请求。
