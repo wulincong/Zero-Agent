@@ -24,6 +24,12 @@ except Exception:  # pragma: no cover - 非 POSIX 环境
     _HAS_TERMIOS = False
 
 
+# 判定"孤立 Esc"时的等待窗口（秒）。
+# 终端转义序列（方向键等）的后续字节几乎立即到达，30ms 足以区分；
+# 过大会让 Esc 响应变迟钝，过小可能误判。
+ESC_SEQ_TIMEOUT = 0.03
+
+
 class InterruptController:
     """线程安全的中断标志 + 键盘监听。"""
 
@@ -104,11 +110,54 @@ class InterruptController:
                     continue
                 if not data:
                     break
-                # 检测 Esc：单独一个 \x1b 视为中断请求
-                if b"\x1b" in data:
+                # 检测 Esc：仅"孤立的 \x1b"才算中断请求。
+                # 方向键/Home/End/Alt+Enter 等都会以 \x1b 开头（转义序列），
+                # 若一并视为 Esc 会造成误中断，故需区分。
+                if self._is_lone_escape(fd, data):
                     self._flag.set()
         finally:
             self._restore_term()
+
+    @staticmethod
+    def _is_lone_escape(fd: int, data: bytes) -> bool:
+        """判断本次读到的数据是否代表"用户按下了 Esc 键"。
+
+        终端里 Esc 键本身只产生一个字节 \x1b；而方向键、Home/End、
+        Alt+Enter 等按键产生的是以 \x1b 开头的多字节转义序列
+        （如 \x1b[A、\x1b[H、\x1b\r）。
+
+        判定策略：
+        - 若 \x1b 之后还有字节，说明是转义序列，不是 Esc；
+        - 若 \x1b 是最后一个字节，则短暂等待（ESC_SEQ_TIMEOUT）看是否
+          还有后续字节：有则是转义序列，没有才是真正的 Esc。
+
+        Args:
+            fd: 正在监听的 stdin 文件描述符。
+            data: 本次 os.read 读到的原始字节。
+
+        Returns:
+            True 表示用户按下了 Esc（应触发中断）。
+        """
+        idx = data.find(b"\x1b")
+        if idx == -1:
+            return False
+        # \x1b 之后仍有字节 -> 转义序列（方向键等），不是 Esc
+        if idx < len(data) - 1:
+            return False
+        # \x1b 位于末尾：等待极短时间，看是否还有后续字节
+        try:
+            r, _, _ = select.select([fd], [], [], ESC_SEQ_TIMEOUT)
+        except (OSError, ValueError):
+            return True
+        if r:
+            # 有后续字节 -> 是转义序列，丢弃并忽略
+            try:
+                os.read(fd, 32)
+            except (BlockingIOError, OSError):
+                pass
+            return False
+        # 无后续字节 -> 孤立的 Esc
+        return True
 
     def _restore_term(self) -> None:
         if self._old_term is not None and self._fd is not None:

@@ -84,16 +84,30 @@ class InteractiveAssistant:
     # ------------------------------------------------------------------
     @staticmethod
     def _confirm_command(cmd: str, reason: str) -> bool:
-        """终端交互确认：危险命令执行前询问用户。"""
+        """终端交互确认：危险命令执行前询问用户。
+
+        注意：确认期间必须暂停 Esc 监听线程。否则监听线程会与
+        prompt_toolkit 争抢同一个 stdin，导致用户输入的 y/Enter 被
+        监听线程读走（或其中的字节被误判为 Esc），进而产生"幽灵中断"。
+        """
         print("\n" + "=" * 60)
         print(f"⚠️  需要确认：{reason}")
         print(f"    命令: {cmd}")
         print("=" * 60)
+
+        # 暂停 Esc 监听，避免与确认输入争抢 stdin
+        from runtime.interrupt import get_interrupt
+        ctrl = get_interrupt()
+        ctrl.stop()
         try:
             from cli.repl import _read_input
             ans = _read_input("是否执行？[y/N] > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
+        finally:
+            # 恢复监听，并清除期间可能残留的中断标志
+            ctrl.clear()
+            ctrl.start()
         return ans in ("y", "yes")
 
     def register_tool(self, tool_func):
