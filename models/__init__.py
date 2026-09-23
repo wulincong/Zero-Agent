@@ -17,6 +17,8 @@ __all__ = [
     "DEFAULT_MODEL",
     "DEFAULT_BASE_URL",
     "DEFAULT_TEMPERATURE",
+    "CONTEXT_MAX_CHARS",
+    "CONTEXT_KEEP_RECENT",
 ]
 
 

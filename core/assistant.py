@@ -59,7 +59,11 @@ class InteractiveAssistant:
         self.bash = PersistentBash(confirm_callback=self._confirm_command)
         self.tools_registry = {}
         # 常驻对话历史：首条固定为系统提示词（自我认知），后续为对话消息
-        self.memory = ConversationMemory(SYSTEM_PROMPT)
+        self.memory = ConversationMemory(
+            SYSTEM_PROMPT,
+            max_chars=_models.CONTEXT_MAX_CHARS,
+            keep_recent=_models.CONTEXT_KEEP_RECENT,
+        )
 
         # 延迟重载标志：工具只置位，真正的重载在 chat() 返回后由主循环执行，
         # 避免在调用栈未清空时替换 self.__dict__ 导致行为不一致。
@@ -160,6 +164,18 @@ class InteractiveAssistant:
         return _models.build_model_from_profile(
             self.model_profile,
             tools=self.tools_registry.values(),
+        )
+
+    def context_report(self) -> str:
+        """展示当前上下文占用情况（消息数 / 字符数 / 预算 / 已丢弃）。"""
+        st = self.memory.stats()
+        pct = (st["chars"] / st["max_chars"] * 100) if st["max_chars"] else 0
+        return (
+            "🧠 上下文占用：\n"
+            f"   消息条数 : {st['messages']}\n"
+            f"   字符总量 : {st['chars']:,} / {st['max_chars']:,}（{pct:.1f}%）\n"
+            f"   已丢弃   : {st['dropped']} 条（超出预算时从最旧处成组丢弃）\n"
+            "   提示     : 预算可用环境变量 AGENT_CONTEXT_MAX_CHARS 调整。"
         )
 
     def list_models(self) -> str:

@@ -121,6 +121,7 @@ HELP_TEXT = """\
    /model   查看可用模型；/model <名称> 切换模型（如 /model gemini）
    /reload  重新加载内核与安全模块（保留对话上下文与 shell 会话）
    /clear   清空对话上下文（仅保留系统提示词）
+   /context 查看上下文占用（消息数 / 字符数 / 预算）
    /expand  展开最近一次工具输出（默认折叠）
    /help    显示本帮助
    exit/q   退出
@@ -149,7 +150,7 @@ except Exception:  # pragma: no cover - 环境缺失时降级
 
 
 # 顶层指令（用于 Tab 补全）
-_COMMANDS = ["/model", "/reload", "/clear", "/expand", "/help", "exit", "quit"]
+_COMMANDS = ["/model", "/reload", "/clear", "/context", "/expand", "/help", "exit", "quit"]
 
 
 if _HAS_PTK:
@@ -301,6 +302,9 @@ def run_repl(assistant) -> None:
             if user_prompt.lower() in ["/clear", "/c"]:
                 assistant.memory.clear()
                 print("\n🧹 已清空对话上下文，仅保留系统提示词。")
+                continue
+            if user_prompt.lower() in ["/context", "/ctx"]:
+                print("\n" + assistant.context_report())
                 continue
             if user_prompt.lower() in ["/expand", "/e"]:
                 expand_last_tool_output()

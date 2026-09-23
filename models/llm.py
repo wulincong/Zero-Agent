@@ -23,6 +23,16 @@ DEFAULT_TIMEOUT = 120.0
 # 失败重试次数。设为 1 表示不自动重试，避免超时场景下等待时间翻倍。
 DEFAULT_MAX_RETRIES = 1
 
+# ----------------------------------------------------------------------
+# 上下文预算（字符数，粗略按 1 token ≈ 2 字符估算）
+# ----------------------------------------------------------------------
+# 超过该预算时，记忆层会从最旧处成组丢弃消息，避免请求超出模型上下文窗口
+# （典型报错：maximum context length is N tokens, however you requested M tokens）。
+# 可用环境变量 AGENT_CONTEXT_MAX_CHARS 覆盖；设为 0 表示不限制。
+CONTEXT_MAX_CHARS = int(os.environ.get("AGENT_CONTEXT_MAX_CHARS", "400000"))
+# 触发压缩后至少保留的最近消息条数。
+CONTEXT_KEEP_RECENT = int(os.environ.get("AGENT_CONTEXT_KEEP_RECENT", "12"))
+
 
 # ----------------------------------------------------------------------
 # 模型档案：每个条目描述一个可切换的模型端点
