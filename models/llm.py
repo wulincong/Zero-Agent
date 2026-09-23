@@ -1,12 +1,19 @@
-"""模型层：LLM 客户端构造。
+"""模型层：LLM 客户端构造与多模型档案（profile）管理。
 
-集中管理模型名、base_url、温度、超时等参数，便于后续切换供应商或模型。
+设计目标：让"切换模型"变成一次配置查找，而不是改代码。
+每个 profile 描述一个可用的模型端点（供应商 / 模型名 / base_url / 密钥环境变量），
+`build_model` 只负责按 profile 构造客户端。
+
+新增一个模型只需在 MODEL_PROFILES 里加一条，无需改动其它层。
 """
+
+import os
 
 from langchain_openai import ChatOpenAI
 
-DEFAULT_MODEL = "deepseek-chat"
-DEFAULT_BASE_URL = "https://api.deepseek.com"
+# ----------------------------------------------------------------------
+# 通用默认参数
+# ----------------------------------------------------------------------
 DEFAULT_TEMPERATURE = 0
 
 # 请求超时（秒）。流式场景下 httpx 的 read 超时是"相邻两个 chunk 之间的最大间隔"，
@@ -17,11 +24,72 @@ DEFAULT_TIMEOUT = 120.0
 DEFAULT_MAX_RETRIES = 1
 
 
+# ----------------------------------------------------------------------
+# 模型档案：每个条目描述一个可切换的模型端点
+# ----------------------------------------------------------------------
+# 字段说明：
+#   model        : 传给供应商的模型名
+#   base_url     : OpenAI 兼容端点地址
+#   api_key_env  : 从哪个环境变量读取密钥
+#   label        : 展示用名称
+#   temperature  : 可选，覆盖默认温度
+#
+# 说明：Gemini 使用官方提供的 OpenAI 兼容端点，因此无需额外依赖
+#       （不必安装 langchain-google-genai），直接复用 ChatOpenAI。
+MODEL_PROFILES: dict[str, dict] = {
+    "deepseek": {
+        "model": "deepseek-chat",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "label": "DeepSeek Chat",
+    },
+    "deepseek-reasoner": {
+        "model": "deepseek-reasoner",
+        "base_url": "https://api.deepseek.com",
+        "api_key_env": "DEEPSEEK_API_KEY",
+        "label": "DeepSeek Reasoner (R1)",
+    },
+    "gemini": {
+        "model": "gemini-2.5-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "label": "Gemini 2.5 Flash",
+    },
+    "gemini-pro": {
+        "model": "gemini-2.5-pro",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "label": "Gemini 2.5 Pro",
+    },
+}
+
+# 默认档案名（可用环境变量 AGENT_DEFAULT_MODEL 覆盖）
+DEFAULT_PROFILE = os.environ.get("AGENT_DEFAULT_MODEL", "deepseek")
+
+# 向后兼容：旧代码可能 import 这两个常量
+DEFAULT_MODEL = MODEL_PROFILES[DEFAULT_PROFILE]["model"]
+DEFAULT_BASE_URL = MODEL_PROFILES[DEFAULT_PROFILE]["base_url"]
+
+
+def get_profile(name: str) -> dict:
+    """按名称取档案；不存在时抛出 KeyError（附带可用列表）。"""
+    if name not in MODEL_PROFILES:
+        raise KeyError(
+            f"未知模型档案 '{name}'。可用: {', '.join(MODEL_PROFILES)}"
+        )
+    return MODEL_PROFILES[name]
+
+
+def resolve_api_key(profile: dict) -> str | None:
+    """从档案指定的环境变量读取密钥；缺失时返回 None。"""
+    return os.environ.get(profile["api_key_env"])
+
+
 def build_model(api_key: str, tools, base_url: str = DEFAULT_BASE_URL,
                 model: str = DEFAULT_MODEL, temperature: float = DEFAULT_TEMPERATURE,
                 timeout: float = DEFAULT_TIMEOUT,
                 max_retries: int = DEFAULT_MAX_RETRIES):
-    """构造绑定了工具的对话模型。"""
+    """构造绑定了工具的对话模型（底层通用构造器）。"""
     return ChatOpenAI(
         model=model,
         api_key=api_key,
@@ -30,3 +98,31 @@ def build_model(api_key: str, tools, base_url: str = DEFAULT_BASE_URL,
         timeout=timeout,
         max_retries=max_retries,
     ).bind_tools(list(tools))
+
+
+def build_model_from_profile(profile_name: str, tools, api_key: str | None = None,
+                             temperature: float | None = None,
+                             timeout: float = DEFAULT_TIMEOUT,
+                             max_retries: int = DEFAULT_MAX_RETRIES):
+    """按档案名构造模型。api_key 为 None 时自动从环境变量读取。
+
+    Raises:
+        KeyError: 档案名不存在。
+        ValueError: 档案对应的密钥环境变量未设置。
+    """
+    profile = get_profile(profile_name)
+    key = api_key or resolve_api_key(profile)
+    if not key:
+        raise ValueError(
+            f"模型 '{profile_name}' 需要环境变量 {profile['api_key_env']}，但未设置。"
+        )
+    return build_model(
+        api_key=key,
+        tools=tools,
+        base_url=profile["base_url"],
+        model=profile["model"],
+        temperature=profile.get("temperature", DEFAULT_TEMPERATURE)
+        if temperature is None else temperature,
+        timeout=timeout,
+        max_retries=max_retries,
+    )

@@ -118,6 +118,7 @@ def expand_last_tool_output() -> None:
 BANNER = "=" * 60
 HELP_TEXT = """\
 📖 可用指令：
+   /model   查看可用模型；/model <名称> 切换模型（如 /model gemini）
    /reload  重新加载内核与安全模块（保留对话上下文与 shell 会话）
    /clear   清空对话上下文（仅保留系统提示词）
    /expand  展开最近一次工具输出（默认折叠）
@@ -209,8 +210,9 @@ def _read_input(prompt: str) -> str:
 def print_banner(assistant) -> None:
     print(BANNER)
     print("🚀 个人专属智能助手已启动！")
-    print("   指令: /reload 热重载代码(保留上下文) | /clear 清空上下文 | /help 帮助 | exit/q 退出")
+    print("   指令: /model 切换模型 | /reload 热重载代码(保留上下文) | /clear 清空上下文 | /help 帮助 | exit/q 退出")
     print("   输入: Enter 提交 | Alt+Enter 换行 | Esc 中断操作 | ←→ 移动光标")
+    print(f"🧠 当前模型: {getattr(assistant, 'model_profile', '?')}")
     print(f"📦 已激活技能库: {list(assistant.tools_registry.keys())}")
     print(BANNER)
 
@@ -230,6 +232,10 @@ def run_repl(assistant) -> None:
             if user_prompt.lower() in ["exit", "quit", "q"]:
                 print("👋 再见！环境与技能已保存。")
                 break
+            if user_prompt.lower().startswith("/model"):
+                arg = user_prompt[len("/model"):].strip()
+                print("\n" + assistant.switch_model(arg))
+                continue
             if user_prompt.lower() in ["/reload", "/r"]:
                 print("\n" + assistant.reload_code())
                 continue

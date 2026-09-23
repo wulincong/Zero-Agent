@@ -28,7 +28,7 @@ def _is_timeout_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "timeout" in text or "timed out" in text
 from memory import ConversationMemory
-from models import DEFAULT_BASE_URL, build_model
+import models as _models
 from runtime import PersistentBash
 from tools import make_bash_tool, make_install_skill_tool, make_reload_tool
 
@@ -45,6 +45,7 @@ RELOADABLE_MODULES = [
     # 防止 Agent 通过 reload_self 自行放宽/绕过自身的安全约束。
     "runtime.bash",
     "tools.builtin",
+    "models.llm",
     "core.prompts",
     "core.assistant",
 ]
@@ -53,7 +54,8 @@ RELOADABLE_MODULES = [
 class InteractiveAssistant:
     def __init__(self, api_key):
         self.api_key = api_key
-        self.base_url = DEFAULT_BASE_URL
+        # 当前激活的模型档案名（可在运行时通过 /model 切换）
+        self.model_profile = _models.DEFAULT_PROFILE
         self.bash = PersistentBash(confirm_callback=self._confirm_command)
         self.tools_registry = {}
         # 常驻对话历史：首条固定为系统提示词（自我认知），后续为对话消息
@@ -140,10 +142,50 @@ class InteractiveAssistant:
     # ------------------------------------------------------------------
     @property
     def model(self):
-        return build_model(
-            api_key=self.api_key,
+        """按当前激活的模型档案构造客户端（每次调用即时构造，便于切换后立即生效）。"""
+        return _models.build_model_from_profile(
+            self.model_profile,
             tools=self.tools_registry.values(),
-            base_url=self.base_url,
+        )
+
+    def list_models(self) -> str:
+        """列出所有可用模型档案，标注当前激活项与密钥是否就绪。"""
+        lines = ["📦 可用模型档案："]
+        for name, prof in _models.MODEL_PROFILES.items():
+            active = "▶" if name == self.model_profile else " "
+            key_ok = "✅" if _models.resolve_api_key(prof) else "❌ 缺少 " + prof["api_key_env"]
+            lines.append(
+                f"  {active} {name:<18} {prof['label']:<24} [{key_ok}]"
+            )
+        lines.append("\n用法：/model <名称>  切换模型（如 /model gemini）")
+        return "\n".join(lines)
+
+    def switch_model(self, name: str) -> str:
+        """切换当前模型档案。切换前校验档案存在且密钥就绪。
+
+        Args:
+            name: _models.MODEL_PROFILES 中的档案名。
+
+        Returns:
+            面向用户的提示文本（成功或失败原因）。
+        """
+        name = (name or "").strip()
+        if not name:
+            return self.list_models()
+        try:
+            prof = _models.get_profile(name)
+        except KeyError as e:
+            return f"❌ {e}"
+        if not _models.resolve_api_key(prof):
+            return (
+                f"❌ 无法切换到 '{name}'：环境变量 {prof['api_key_env']} 未设置。\n"
+                f"   请在 .env 中补充 {prof['api_key_env']}=xxx 后重启进程。"
+            )
+        old = self.model_profile
+        self.model_profile = name
+        return (
+            f"✅ 模型已切换：{old} → {name}（{prof['label']}）\n"
+            f"   下一轮对话即生效，对话上下文与 shell 会话保持不变。"
         )
 
     # ------------------------------------------------------------------
@@ -203,6 +245,7 @@ class InteractiveAssistant:
             "memory": self.memory,
             "bash": self.bash,
             "api_key": self.api_key,
+            "model_profile": getattr(self, "model_profile", _models.DEFAULT_PROFILE),
         }
 
         try:
@@ -220,7 +263,7 @@ class InteractiveAssistant:
             # 用旧状态构造新实例（不新建 bash，避免丢 shell 状态）
             new_obj = new_cls.__new__(new_cls)
             new_obj.api_key = preserved["api_key"]
-            new_obj.base_url = getattr(self, "base_url", DEFAULT_BASE_URL)
+            new_obj.model_profile = preserved["model_profile"]
             new_obj.bash = preserved["bash"]
             new_obj.tools_registry = {}
             new_obj.memory = preserved["memory"]
