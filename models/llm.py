@@ -88,38 +88,10 @@ MODEL_PROFILES: dict[str, dict] = {
         "api_key_env": "GEMINI_API_KEY",
         "label": "Gemini 3.1 Pro (preview)",
     },
-    "gemini-3.8-flash": {
-        "model": "gemini-3.8-flash",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "label": "Gemini 3.8 Flash",
-    },
-    "gemini-3.7-flash": {
-        "model": "gemini-3.7-flash",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "label": "Gemini 3.7 Flash",
-    },
-    "gemini-3.6-flash": {
-        "model": "gemini-3.6-flash",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "label": "Gemini 3.6 Flash",
-    },
-    "gemini-3.5-flash": {
-        "model": "gemini-3.5-flash",
-        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
-        "api_key_env": "GEMINI_API_KEY",
-        "label": "Gemini 3.5 Flash",
-    },
 }
 
 # 默认档案名（可用环境变量 AGENT_DEFAULT_MODEL 覆盖）
 DEFAULT_PROFILE = _config.get_str("model.default_profile", "deepseek")
-
-# 向后兼容：旧代码可能 import 这两个常量
-DEFAULT_MODEL = MODEL_PROFILES[DEFAULT_PROFILE]["model"]
-DEFAULT_BASE_URL = MODEL_PROFILES[DEFAULT_PROFILE]["base_url"]
 
 
 def get_profile(name: str) -> dict:
@@ -136,15 +108,19 @@ def resolve_api_key(profile: dict) -> str | None:
     return os.environ.get(profile["api_key_env"])
 
 
-def build_model(api_key: str, tools, base_url: str = DEFAULT_BASE_URL,
-                model: str = DEFAULT_MODEL, temperature: float = DEFAULT_TEMPERATURE,
+def build_model(api_key: str, tools, base_url: str | None = None,
+                model: str | None = None, temperature: float = DEFAULT_TEMPERATURE,
                 timeout: float = DEFAULT_TIMEOUT,
                 max_retries: int = DEFAULT_MAX_RETRIES):
-    """构造绑定了工具的对话模型（底层通用构造器）。"""
+    """构造绑定了工具的对话模型（底层通用构造器）。
+
+    base_url / model 为 None 时，取默认档案（DEFAULT_PROFILE）对应的值。
+    """
+    profile = MODEL_PROFILES[DEFAULT_PROFILE]
     return ChatOpenAI(
-        model=model,
+        model=model or profile["model"],
         api_key=api_key,
-        base_url=base_url,
+        base_url=base_url or profile["base_url"],
         temperature=temperature,
         timeout=timeout,
         max_retries=max_retries,

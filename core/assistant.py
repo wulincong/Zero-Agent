@@ -21,6 +21,13 @@ class _Interrupted(Exception):
     """内部信号：表示用户中断了当前操作。"""
 
 
+from core import state as _state
+from memory import ConversationMemory
+import models as _models
+from runtime import PersistentBash
+from tools import make_bash_tool, make_install_skill_tool, make_reload_tool
+
+
 def _is_timeout_error(exc: Exception) -> bool:
     """判断异常是否为超时/网络类错误（此类错误不应盲目重发请求）。"""
     name = type(exc).__name__.lower()
@@ -28,11 +35,6 @@ def _is_timeout_error(exc: Exception) -> bool:
         return True
     text = str(exc).lower()
     return "timeout" in text or "timed out" in text
-from core import state as _state
-from memory import ConversationMemory
-import models as _models
-from runtime import PersistentBash
-from tools import make_bash_tool, make_install_skill_tool, make_reload_tool
 
 # 技能库目录（相对项目根目录）
 SKILLS_DIR = os.path.abspath("./skills")
@@ -77,17 +79,6 @@ class InteractiveAssistant:
         self._bootstrap_existing_skills()  # 安装技能库
 
     # ------------------------------------------------------------------
-    # 兼容属性：messages 直接映射到 memory.messages
-    # ------------------------------------------------------------------
-    @property
-    def messages(self):
-        return self.memory.messages
-
-    @messages.setter
-    def messages(self, value):
-        self.memory.messages = value
-
-    # ------------------------------------------------------------------
     # 工具注册
     # ------------------------------------------------------------------
     @staticmethod
@@ -119,7 +110,14 @@ class InteractiveAssistant:
         return ans in ("y", "yes")
 
     def register_tool(self, tool_func):
-        t = tool_func if hasattr(tool_func, "name") else tool_func
+        """注册一个工具到工具表。
+
+        传入裸函数时自动用 @tool 包装为 function call 工具；
+        传入已包装的 StructuredTool 时直接注册（幂等）。
+        """
+        from langchain_core.tools import tool as _tool
+
+        t = tool_func if hasattr(tool_func, "name") else _tool(tool_func)
         self.tools_registry[t.name] = t
 
     def _on_tool_output(self, command: str, output: str) -> None:
@@ -416,7 +414,8 @@ class InteractiveAssistant:
                         if fn_name not in ["run_bash", "install_skill"]:
                             print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
                         try:
-                            res = self._invoke_tool(target_tool, fn_args, ctrl)
+                            # run_bash 内部通过全局中断控制器实现命令级中断
+                            res = target_tool.invoke(fn_args)
                         except _Interrupted:
                             self._rollback(start_len)
                             return "⏹️ 已中断（工具执行阶段）。已回到对话。"
@@ -626,10 +625,6 @@ class InteractiveAssistant:
         if status == "error":
             raise value
         return value
-
-    def _invoke_tool(self, target_tool, fn_args, ctrl):
-        """执行工具。run_bash 内部通过全局中断控制器实现命令级中断。"""
-        return target_tool.invoke(fn_args)
 
     def _rollback(self, start_len: int) -> None:
         """回滚本轮对话产生的消息，保证历史一致（不残留残缺 tool_call）。"""

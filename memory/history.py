@@ -6,10 +6,10 @@
 
 from langchain_core.messages import HumanMessage, SystemMessage
 
-# 上下文预算（字符数，粗略按 1 token ≈ 2 字符估算）。
-# 超过预算时，从最旧的消息开始成组丢弃，保证不破坏 tool_call / ToolMessage 配对。
+# 上下文预算兜底默认值（字符数，粗略按 1 token ≈ 2 字符估算）。
+# 注意：实际生效值由 models/llm.py 从 config.toml 的 [context] 段读取后传入，
+# 这里的常量仅在调用方未显式传参时兜底，数值应与 config.toml 保持一致。
 DEFAULT_MAX_CHARS = 400_000
-# 触发压缩后，至少保留的最近消息条数（避免把当前任务上下文也丢掉）。
 DEFAULT_KEEP_RECENT = 12
 
 
