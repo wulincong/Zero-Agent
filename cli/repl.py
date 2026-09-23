@@ -282,6 +282,17 @@ def print_banner(assistant) -> None:
     print(BANNER)
 
 
+def _save_session_state(assistant) -> None:
+    """退出时持久化会话配置（当前模型档案），供下次启动恢复。"""
+    try:
+        from core import state as _state
+        profile = getattr(assistant, "model_profile", None)
+        if profile:
+            _state.save_model_profile(profile)
+    except Exception:
+        pass  # 保存失败不影响退出
+
+
 def run_repl(assistant) -> None:
     """启动交互式 REPL，直到用户退出。"""
     print_banner(assistant)
@@ -290,11 +301,13 @@ def run_repl(assistant) -> None:
             try:
                 user_prompt = _read_input("\n👤 You > ", assistant).strip()
             except EOFError:
+                _save_session_state(assistant)
                 print("\n👋 再见！环境与技能已保存。")
                 break
             if not user_prompt:
                 continue
             if user_prompt.lower() in ["exit", "quit", "q"]:
+                _save_session_state(assistant)
                 print("👋 再见！环境与技能已保存。")
                 break
             if user_prompt.lower().startswith("/model"):

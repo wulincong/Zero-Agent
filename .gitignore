@@ -219,3 +219,6 @@ __marimo__/
 
 # Backup files
 *.bak
+
+# Agent 会话状态（记录上次退出时的模型等配置）
+.agent_state.json

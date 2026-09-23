@@ -28,6 +28,7 @@ def _is_timeout_error(exc: Exception) -> bool:
         return True
     text = str(exc).lower()
     return "timeout" in text or "timed out" in text
+from core import state as _state
 from memory import ConversationMemory
 import models as _models
 from runtime import PersistentBash
@@ -56,7 +57,8 @@ class InteractiveAssistant:
     def __init__(self, api_key):
         self.api_key = api_key
         # 当前激活的模型档案名（可在运行时通过 /model 切换）
-        self.model_profile = _models.DEFAULT_PROFILE
+        # 优先恢复上次退出时保存的档案；若已失效（档案被删/密钥缺失）则回退默认。
+        self.model_profile = self._restore_model_profile()
         self.bash = PersistentBash(confirm_callback=self._confirm_command)
         self.tools_registry = {}
         # 常驻对话历史：首条固定为系统提示词（自我认知），后续为对话消息
@@ -179,6 +181,19 @@ class InteractiveAssistant:
             "   提示     : 预算可用环境变量 AGENT_CONTEXT_MAX_CHARS 调整。"
         )
 
+    @staticmethod
+    def _restore_model_profile() -> str:
+        """确定启动时的模型档案：优先上次保存值，失效则回退默认。
+
+        校验两点：档案仍存在、密钥环境变量已就绪。
+        任一不满足都静默回退到 DEFAULT_PROFILE，保证启动不被阻断。
+        """
+        saved = _state.get_saved_model_profile()
+        if saved and saved in _models.MODEL_PROFILES:
+            if _models.resolve_api_key(_models.MODEL_PROFILES[saved]):
+                return saved
+        return _models.DEFAULT_PROFILE
+
     def list_models(self) -> str:
         """列出所有可用模型档案，标注当前激活项与密钥是否就绪。"""
         lines = ["📦 可用模型档案："]
@@ -214,9 +229,12 @@ class InteractiveAssistant:
             )
         old = self.model_profile
         self.model_profile = name
+        saved = _state.save_model_profile(name)
+        tail = "已记住该选择，下次启动自动恢复。" if saved else "（⚠️ 状态保存失败，下次启动将回到默认模型）"
         return (
             f"✅ 模型已切换：{old} → {name}（{prof['label']}）\n"
-            f"   下一轮对话即生效，对话上下文与 shell 会话保持不变。"
+            f"   下一轮对话即生效，对话上下文与 shell 会话保持不变。\n"
+            f"   {tail}"
         )
 
     # ------------------------------------------------------------------
