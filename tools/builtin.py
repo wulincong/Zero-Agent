@@ -9,17 +9,26 @@ import os
 from langchain_core.tools import tool
 
 
-def make_bash_tool(bash):
-    """构造 run_bash 工具：在持久终端中执行命令。"""
+def make_bash_tool(bash, on_output=None):
+    """构造 run_bash 工具：在持久终端中执行命令。
+
+    Args:
+        bash: 持久终端实例。
+        on_output: 可选回调 on_output(command, output)，用于把命令回显与输出
+            交给上层（CLI）决定如何呈现（如折叠）。为 None 时回退为直接打印。
+    """
 
     @tool
     def run_bash(command: str) -> str:
         """在持久终端中执行 Bash 命令。环境变量和目录切换全生命周期保持生效。"""
         from runtime.interrupt import get_interrupt
 
-        print(f"\n💻 [Shell]: {command}")
         out = bash.run(command, interrupt=get_interrupt())
-        print(f"📄 [Output]:\n{out}")
+        if on_output is not None:
+            on_output(command, out)
+        else:
+            print(f"\n💻 [Shell]: {command}")
+            print(f"📄 [Output]:\n{out}")
         return out
 
     return run_bash

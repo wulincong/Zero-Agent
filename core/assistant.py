@@ -98,8 +98,21 @@ class InteractiveAssistant:
         t = tool_func if hasattr(tool_func, "name") else tool_func
         self.tools_registry[t.name] = t
 
+    def _on_tool_output(self, command: str, output: str) -> None:
+        """run_bash 的输出回调：转发给当前注册的 on_tool_output 处理器。
+
+        由 chat() 在每轮对话开始时设置 self._tool_output_handler，
+        使 CLI 能决定如何呈现（如折叠）。未设置时回退为直接打印。
+        """
+        handler = getattr(self, "_tool_output_handler", None)
+        if handler is not None:
+            handler(command, output)
+        else:
+            print(f"\n💻 [Shell]: {command}")
+            print(f"📄 [Output]:\n{output}")
+
     def _register_builtin_tools(self):
-        self.register_tool(make_bash_tool(self.bash))
+        self.register_tool(make_bash_tool(self.bash, on_output=self._on_tool_output))
         self.register_tool(make_install_skill_tool(SKILLS_DIR, self._load_skill_file))
         self.register_tool(make_reload_tool(self))
 
@@ -231,7 +244,7 @@ class InteractiveAssistant:
     # ------------------------------------------------------------------
     # 对话驱动
     # ------------------------------------------------------------------
-    def chat(self, user_input: str, on_tool_call=None) -> str:
+    def chat(self, user_input: str, on_tool_call=None, on_tool_output=None) -> str:
         """多轮对话单步驱动器（支持 Esc 中断）。
 
         Args:
@@ -239,6 +252,8 @@ class InteractiveAssistant:
                 签名 on_tool_call(name, args=None)：
                 - 模型刚决定调用工具时，以 (name, None) 调用（参数尚未生成）；
                 - 参数聚合完成后，以 (name, args) 再次调用。
+            on_tool_output: 可选回调 on_tool_output(command, output)，
+                用于接管 run_bash 的命令回显与输出呈现（如折叠）。
         """
         # 兜底：确保系统提示词始终位于对话历史首位（热重载/异常后自愈）
         self.memory.ensure_system_prompt()
@@ -253,6 +268,9 @@ class InteractiveAssistant:
         # 记录本轮起始位置，便于中断时回滚，保证历史一致
         start_len = len(self.memory)
         self.memory.add_user(user_input)
+
+        # 设置本轮的工具输出处理器，供 run_bash 回调使用
+        self._tool_output_handler = on_tool_output
 
         ctrl.start()  # 启动 Esc 监听（仅 TTY 下生效）
         try:
@@ -310,6 +328,7 @@ class InteractiveAssistant:
                         tool_call_id=call["id"]
                     ))
         finally:
+            self._tool_output_handler = None
             ctrl.stop()
 
     def _stream_model(self, ctrl, on_tool_call=None):

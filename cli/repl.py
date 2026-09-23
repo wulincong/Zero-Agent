@@ -85,11 +85,42 @@ def make_tool_call_printer():
     return on_tool_call
 
 
+# 最近一次工具输出（供 /expand 展开）
+_LAST_TOOL_OUTPUT = {"command": None, "output": None}
+
+
+def make_tool_output_handler():
+    """构造工具输出处理器：默认折叠，仅显示命令与输出行数。
+
+    返回的回调签名：on_tool_output(command, output)。
+    完整输出被暂存，用户输入 /expand 时可展开查看。
+    """
+    def on_tool_output(command: str, output: str) -> None:
+        _LAST_TOOL_OUTPUT["command"] = command
+        _LAST_TOOL_OUTPUT["output"] = output
+        lines = output.count("\n") + (1 if output and not output.endswith("\n") else 0)
+        print(f"\n💻 [Shell]: {command}", flush=True)
+        print(f"   └─ 输出 {lines} 行已折叠（/expand 查看）", flush=True)
+    return on_tool_output
+
+
+def expand_last_tool_output() -> None:
+    """展开最近一次工具输出。"""
+    cmd = _LAST_TOOL_OUTPUT["command"]
+    out = _LAST_TOOL_OUTPUT["output"]
+    if cmd is None:
+        print("\n（暂无可展开的工具输出）")
+        return
+    print(f"\n💻 [Shell]: {cmd}")
+    print(f"📄 [Output]:\n{out}")
+
+
 BANNER = "=" * 60
 HELP_TEXT = """\
 📖 可用指令：
    /reload  重新加载内核与安全模块（保留对话上下文与 shell 会话）
    /clear   清空对话上下文（仅保留系统提示词）
+   /expand  展开最近一次工具输出（默认折叠）
    /help    显示本帮助
    exit/q   退出
 
@@ -206,11 +237,16 @@ def run_repl(assistant) -> None:
                 assistant.memory.clear()
                 print("\n🧹 已清空对话上下文，仅保留系统提示词。")
                 continue
+            if user_prompt.lower() in ["/expand", "/e"]:
+                expand_last_tool_output()
+                continue
             if user_prompt.lower() in ["/help", "/h"]:
                 print("\n" + HELP_TEXT)
                 continue
             response = assistant.chat(
-                user_prompt, on_tool_call=make_tool_call_printer()
+                user_prompt,
+                on_tool_call=make_tool_call_printer(),
+                on_tool_output=make_tool_output_handler(),
             )
             render_markdown(response)
 
