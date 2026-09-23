@@ -130,6 +130,7 @@ HELP_TEXT = """\
    Alt+Enter      换行（多行输入；部分终端为 Esc 后按 Enter）
    ← → / Home/End 移动光标
    ↑ ↓            翻阅历史
+   Tab            补全指令与模型名（如 /model 后按 Tab）
    Esc            中断当前操作（模型调用/命令执行），回到对话
    Ctrl+C         清空当前输入行"""
 
@@ -138,6 +139,7 @@ HELP_TEXT = """\
 # ----------------------------------------------------------------------
 try:
     from prompt_toolkit import PromptSession
+    from prompt_toolkit.completion import Completer, Completion
     from prompt_toolkit.history import InMemoryHistory
     from prompt_toolkit.key_binding import KeyBindings
 
@@ -146,8 +148,56 @@ except Exception:  # pragma: no cover - 环境缺失时降级
     _HAS_PTK = False
 
 
-def _build_session():
-    """构造带行编辑与多行能力的输入会话；不可用时返回 None。"""
+# 顶层指令（用于 Tab 补全）
+_COMMANDS = ["/model", "/reload", "/clear", "/expand", "/help", "exit", "quit"]
+
+
+if _HAS_PTK:
+    class _AgentCompleter(Completer):
+        """REPL 补全器：
+
+        - 行首输入 `/` 时补全指令名；
+        - 输入 `/model ` 后补全模型档案名（由 model_provider 动态提供）。
+        """
+
+        def __init__(self, model_provider=None):
+            # model_provider: 返回当前可用档案名列表的可调用对象
+            self._model_provider = model_provider
+
+        def get_completions(self, document, complete_event):
+            text = document.text_before_cursor
+            # 仅对单行输入补全（多行输入不干扰）
+            if "\n" in text:
+                return
+
+            stripped = text.lstrip()
+            # 场景一：/model <前缀> —— 补全模型档案名
+            if stripped.startswith("/model "):
+                prefix = stripped[len("/model "):]
+                if " " in prefix:  # 已经输入了完整参数，不再补全
+                    return
+                for name in self._model_names():
+                    if name.startswith(prefix):
+                        yield Completion(name, start_position=-len(prefix))
+                return
+
+            # 场景二：行首以 / 开头 —— 补全指令名
+            if stripped.startswith("/") and " " not in stripped:
+                for cmd in _COMMANDS:
+                    if cmd.startswith(stripped):
+                        yield Completion(cmd, start_position=-len(stripped))
+
+        def _model_names(self):
+            if self._model_provider is None:
+                return []
+            try:
+                return list(self._model_provider())
+            except Exception:
+                return []
+
+
+def _build_session(assistant=None):
+    """构造带行编辑、多行与 Tab 补全的输入会话；不可用时返回 None。"""
     if not _HAS_PTK:
         return None
     # 仅在真正的 TTY 下启用，避免管道/重定向场景报错
@@ -181,9 +231,18 @@ def _build_session():
         if not event.app.current_buffer.text:
             event.app.exit(exception=EOFError)
 
+    # 补全器：模型档案名从 assistant 动态获取（切换/热重载后自动同步）
+    def _model_names():
+        from models import MODEL_PROFILES
+        return list(MODEL_PROFILES.keys())
+
+    completer = _AgentCompleter(model_provider=_model_names)
+
     return PromptSession(
         history=InMemoryHistory(),
         key_bindings=kb,
+        completer=completer,
+        complete_while_typing=False,  # 仅在按 Tab 时补全，避免干扰正常输入
         multiline=True,  # 允许缓冲区含换行；Enter 仍提交（见下方绑定）
     )
 
@@ -191,11 +250,11 @@ def _build_session():
 _SESSION = None
 
 
-def _read_input(prompt: str) -> str:
+def _read_input(prompt: str, assistant=None) -> str:
     """读取用户输入（支持多行），优先使用 prompt_toolkit。"""
     global _SESSION
     if _SESSION is None:
-        _SESSION = _build_session()
+        _SESSION = _build_session(assistant)
     if _SESSION is not None:
         try:
             return _SESSION.prompt(prompt, prompt_continuation="... ")
@@ -223,7 +282,7 @@ def run_repl(assistant) -> None:
     try:
         while True:
             try:
-                user_prompt = _read_input("\n👤 You > ").strip()
+                user_prompt = _read_input("\n👤 You > ", assistant).strip()
             except EOFError:
                 print("\n👋 再见！环境与技能已保存。")
                 break
