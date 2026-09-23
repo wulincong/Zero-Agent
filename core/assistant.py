@@ -14,6 +14,11 @@ import time
 
 from langchain_core.messages import SystemMessage
 
+from core.events import (
+    EventBus,
+    ToolCallEvent,
+    ToolResultEvent,
+)
 from core.prompts import SYSTEM_PROMPT
 
 
@@ -64,6 +69,9 @@ class InteractiveAssistant:
         self.model_profile = self._restore_model_profile()
         self.bash = PersistentBash(confirm_callback=self._confirm_command)
         self.tools_registry = {}
+        # 事件总线：内核只负责 emit，CLI/日志等外部通过 subscribe 订阅。
+        # 阶段 1 用 emit_sync 派发；阶段 2 异步化后改用 await emit。
+        self.bus = EventBus()
         # 常驻对话历史：首条固定为系统提示词（自我认知），后续为对话消息
         self.memory = ConversationMemory(
             SYSTEM_PROMPT,
@@ -121,17 +129,22 @@ class InteractiveAssistant:
         self.tools_registry[t.name] = t
 
     def _on_tool_output(self, command: str, output: str) -> None:
-        """run_bash 的输出回调：转发给当前注册的 on_tool_output 处理器。
+        """run_bash 的输出回调：发布 ToolResultEvent 到事件总线。
 
         由 chat() 在每轮对话开始时设置 self._tool_output_handler，
         使 CLI 能决定如何呈现（如折叠）。未设置时回退为直接打印。
+
+        阶段 1 说明：为保持行为逐字节等价，这里仍优先走 _tool_output_handler
+        （由 chat() 注入的临时处理器）；仅当未注入时才发布事件。
+        阶段 2 起将统一改为发布事件、由 CLI 订阅。
         """
         handler = getattr(self, "_tool_output_handler", None)
         if handler is not None:
             handler(command, output)
         else:
-            print(f"\n💻 [Shell]: {command}")
-            print(f"📄 [Output]:\n{output}")
+            self.bus.emit_sync(ToolResultEvent(
+                name="run_bash", command=command, result=output,
+            ))
 
     def _register_builtin_tools(self):
         self.register_tool(make_bash_tool(self.bash, on_output=self._on_tool_output))
@@ -294,6 +307,8 @@ class InteractiveAssistant:
             "bash": self.bash,
             "api_key": self.api_key,
             "model_profile": getattr(self, "model_profile", _models.DEFAULT_PROFILE),
+            # 事件总线连同其订阅者一起保留：重载不应丢失 CLI 注册的订阅者
+            "bus": getattr(self, "bus", None),
         }
 
         try:
@@ -318,6 +333,8 @@ class InteractiveAssistant:
             new_obj.bash = preserved["bash"]
             new_obj.tools_registry = {}
             new_obj.memory = preserved["memory"]
+            # 恢复事件总线（保留订阅者）；旧实例无 bus 时新建一个
+            new_obj.bus = preserved["bus"] or EventBus()
             new_obj._pending_reload = False
             # 重新注册工具（使用新代码里的工具定义）
             new_obj._register_builtin_tools()
@@ -403,9 +420,12 @@ class InteractiveAssistant:
                     fn_name = call["name"]
                     fn_args = call["args"]
 
-                    # 参数已聚合完成，通知回调显示完整参数（工具名此前已流式提示过）
+                    # 参数已聚合完成，通知显示完整参数（工具名此前已流式提示过）
+                    # 互斥规则：有临时回调时走回调，否则发布事件（避免重复打印）
                     if on_tool_call:
                         on_tool_call(fn_name, fn_args)
+                    else:
+                        self.bus.emit_sync(ToolCallEvent(name=fn_name, args=fn_args))
 
                     target_tool = self.tools_registry.get(fn_name)
                     if not target_tool:
@@ -566,10 +586,15 @@ class InteractiveAssistant:
                 mark_first()
                 state["chunks"] += 1
                 # 工具调用流式：工具名一出现就通知（参数逐字符生成，此处不通知）
-                if on_tool_call and getattr(chunk, "tool_call_chunks", None):
+                if getattr(chunk, "tool_call_chunks", None):
                     for tc in chunk.tool_call_chunks:
                         if tc.get("name"):
-                            on_tool_call(tc["name"])
+                            # 工具名一出现就通知（参数尚未聚合）
+                            # 互斥规则：有临时回调时走回调，否则发布事件
+                            if on_tool_call:
+                                on_tool_call(tc["name"])
+                            else:
+                                self.bus.emit_sync(ToolCallEvent(name=tc["name"]))
                 agg = state["aggregated"]
                 state["aggregated"] = chunk if agg is None else agg + chunk
             return state["aggregated"]

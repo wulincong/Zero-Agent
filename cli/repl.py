@@ -101,6 +101,36 @@ def make_tool_output_handler():
     return on_tool_output
 
 
+def register_event_subscribers(assistant) -> None:
+    """把 CLI 的呈现逻辑注册为事件订阅者（阶段 1 引入）。
+
+    与旧的"回调工厂"相比，订阅方式让内核不再需要知道 CLI 的存在：
+    内核只 emit 事件，CLI 决定怎么呈现。
+
+    订阅内容：
+      - ToolCallEvent   -> 打印工具名 / 参数（复用 make_tool_call_printer 的格式）
+      - ToolResultEvent -> 折叠输出（复用 make_tool_output_handler 的格式）
+
+    注意：阶段 1 为保持行为逐字节等价，chat() 仍会注入临时回调，
+    因此这里注册的订阅者与回调会同时存在。为避免重复打印，
+    订阅者仅在"无临时回调"时生效——由内核侧保证（见 _on_tool_output）。
+    本函数注册的订阅者主要用于：非 chat() 路径（如未来异步化后）的事件呈现。
+    """
+    from core.events import ToolCallEvent, ToolResultEvent
+
+    printer = make_tool_call_printer()
+    folder = make_tool_output_handler()
+
+    def _on_tool_call(event) -> None:
+        printer(event.name, event.args)
+
+    def _on_tool_result(event) -> None:
+        folder(event.command, event.result)
+
+    assistant.bus.subscribe(ToolCallEvent, _on_tool_call)
+    assistant.bus.subscribe(ToolResultEvent, _on_tool_result)
+
+
 def expand_last_tool_output() -> None:
     """展开最近一次工具输出。"""
     cmd = _LAST_TOOL_OUTPUT["command"]
@@ -310,6 +340,8 @@ def _save_session_state(assistant) -> None:
 
 def run_repl(assistant) -> None:
     """启动交互式 REPL，直到用户退出。"""
+    # 注册事件订阅者：内核 emit 事件，CLI 负责呈现
+    register_event_subscribers(assistant)
     print_banner(assistant)
     try:
         while True:
