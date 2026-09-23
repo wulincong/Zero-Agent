@@ -10,6 +10,7 @@ import glob
 import importlib.util
 import os
 import sys
+import time
 
 from langchain_core.messages import SystemMessage
 
@@ -354,9 +355,15 @@ class InteractiveAssistant:
                 except _Interrupted:
                     self._rollback(start_len)
                     return "⏹️ 已中断（模型调用阶段）。已回到对话。"
+                except TimeoutError as e:
+                    self._rollback(start_len)
+                    return (
+                        f"⏱️ 模型调用超时：{e}\n"
+                        f"   可重试，或用 /model 切换到其它模型。"
+                    )
                 except Exception as e:
                     self._rollback(start_len)
-                    return f"❌ 模型调用失败: {e}"
+                    return f"❌ 模型调用失败: {type(e).__name__}: {e}"
 
                 if ai_msg is None:  # 被中断
                     self._rollback(start_len)
@@ -404,11 +411,118 @@ class InteractiveAssistant:
             self._tool_output_handler = None
             ctrl.stop()
 
-    def _stream_model(self, ctrl, on_tool_call=None):
-        """流式调用模型并聚合为完整 AIMessage；中断时返回 None。
+    @staticmethod
+    def _make_wait_notifier(threshold: float = 5.0, interval: float = 15.0):
+        """构造"仍在等待"提示回调：等待超过阈值后周期性打印一次。
 
-        流式的好处：每收到一个 chunk 就检查一次中断标志，
-        用户按 Esc 后能在极短时间内停止等待。
+        目的：模型调用卡住时用户看不到任何反馈，容易误以为程序死机。
+        这里在等待期间给出明确提示（含已等待秒数与 Esc 提示），
+        让用户知道进程仍在工作、可以按 Esc 中断。
+
+        Args:
+            threshold: 首次提示的等待秒数（默认 5s）。
+            interval: 之后每隔多少秒再提示一次（默认 15s）。
+
+        Returns:
+            回调 on_wait(elapsed)，可安全传入 _run_interruptible。
+        """
+        state = {"next": threshold}
+
+        def on_wait(elapsed: float) -> None:
+            if elapsed >= state["next"]:
+                print(
+                    f"\n⏳ 模型仍在响应中…（已等待 {elapsed:.0f}s，"
+                    f"按 Esc 可中断）",
+                    flush=True,
+                )
+                state["next"] = elapsed + interval
+
+        return on_wait
+
+    def _run_interruptible(self, fn, ctrl, *, first_byte_timeout=None,
+                           total_timeout=None, on_wait=None):
+        """在独立工作线程中执行阻塞调用，主线程轮询中断标志与超时。
+
+        为什么必须这样做：
+            模型 SDK 的 `stream()` / `invoke()` 是阻塞迭代。若服务端在
+            TCP 连接建立后迟迟不返回任何数据（半开连接、网关挂起等），
+            迭代器会一直阻塞在 socket read 上，**永远进不到循环体**，
+            因此循环体内的 `ctrl.is_set()` 检查形同虚设 —— 表现为
+            "卡死、Esc 无效、无任何报错"。
+
+            把调用放进工作线程后，主线程只负责轮询，即使底层 socket
+            完全 hang 住，也能在毫秒级响应 Esc，并在超时后主动放弃等待。
+
+        Args:
+            fn: 无参可调用对象，在工作线程中执行，返回值经 result 传出。
+            ctrl: 中断控制器（提供 is_set()）。
+            first_byte_timeout: 首个数据到达前的最大等待秒数（None 表示不限）。
+                用于捕获"连上了但服务端不吐字"的场景。
+            total_timeout: 整体最大等待秒数（None 表示不限）。
+            on_wait: 可选回调 on_wait(elapsed)，主线程在等待期间周期性调用，
+                用于向用户提示"仍在等待"，避免误以为程序卡死。
+
+        Returns:
+            (status, value)：
+                status == "ok"        -> value 为 fn 的返回值
+                status == "interrupted" -> 用户按 Esc
+                status == "timeout"     -> 超时（value 为超时描述）
+                status == "error"       -> value 为工作线程抛出的异常对象
+        """
+        import threading
+
+        box = {"done": False, "value": None, "error": None, "first": False}
+        lock = threading.Lock()
+
+        def _mark_first():
+            with lock:
+                box["first"] = True
+
+        def _worker():
+            try:
+                box["value"] = fn(_mark_first)
+            except BaseException as e:  # noqa: BLE001 - 需捕获全部异常回传主线程
+                box["error"] = e
+            finally:
+                with lock:
+                    box["done"] = True
+
+        t = threading.Thread(target=_worker, name="model-call", daemon=True)
+        t.start()
+
+        start = time.monotonic()
+        while True:
+            with lock:
+                done = box["done"]
+                first = box["first"]
+            if done:
+                break
+            if ctrl.is_set():
+                return "interrupted", None
+            now = time.monotonic()
+            elapsed = now - start
+            if total_timeout is not None and elapsed > total_timeout:
+                return "timeout", f"整体等待超过 {total_timeout:.0f}s"
+            if (first_byte_timeout is not None and not first
+                    and elapsed > first_byte_timeout):
+                return "timeout", f"连接后 {first_byte_timeout:.0f}s 内未收到任何数据"
+            if on_wait is not None:
+                try:
+                    on_wait(elapsed)
+                except Exception:
+                    pass
+            time.sleep(0.05)
+
+        if box["error"] is not None:
+            return "error", box["error"]
+        return "ok", box["value"]
+
+    def _stream_model(self, ctrl, on_tool_call=None):
+        """流式调用模型并聚合为完整 AIMessage；中断/超时返回 None。
+
+        实现要点：真正的网络调用跑在独立工作线程里（见 _run_interruptible），
+        主线程只做轮询，因此即使底层 socket 完全 hang 住，Esc 也能立即生效，
+        且超时后不会无限等待。
 
         Args:
             on_tool_call: 可选回调 on_tool_call(name, args=None)。
@@ -417,31 +531,79 @@ class InteractiveAssistant:
         """
         from langchain_core.messages import AIMessageChunk
 
-        aggregated = None
-        try:
+        # 首字节超时：连接建立后迟迟不吐字（服务端挂起）时及时失败。
+        # 整体超时：给足长思考/长输出的空间，但兜底防止无限等待。
+        first_byte_timeout = _models.FIRST_BYTE_TIMEOUT
+        total_timeout = _models.TOTAL_TIMEOUT
+
+        state = {"aggregated": None, "chunks": 0}
+        on_wait = self._make_wait_notifier()
+
+        def _do_stream(mark_first):
+            """在工作线程中执行流式调用，逐 chunk 聚合。"""
             for chunk in self.model.stream(self.memory.messages):
-                if ctrl.is_set():
-                    return None
+                mark_first()
+                state["chunks"] += 1
                 # 工具调用流式：工具名一出现就通知（参数逐字符生成，此处不通知）
                 if on_tool_call and getattr(chunk, "tool_call_chunks", None):
                     for tc in chunk.tool_call_chunks:
                         if tc.get("name"):
                             on_tool_call(tc["name"])
-                aggregated = chunk if aggregated is None else aggregated + chunk
-        except Exception as e:
+                agg = state["aggregated"]
+                state["aggregated"] = chunk if agg is None else agg + chunk
+            return state["aggregated"]
+
+        status, value = self._run_interruptible(
+            _do_stream, ctrl,
+            first_byte_timeout=first_byte_timeout,
+            total_timeout=total_timeout,
+            on_wait=on_wait,
+        )
+
+        if status == "interrupted":
+            return None
+        if status == "timeout":
+            raise TimeoutError(
+                f"模型调用超时（{value}）。可能是网络不通、服务端无响应或"
+                f"请求过大。已放弃等待，可重试或切换模型（/model）。"
+            )
+        if status == "error":
+            e = value
             # 中断优先：用户已按 Esc 时直接返回，不再重发请求。
             if ctrl.is_set():
                 return None
             # 仅在"尚未收到任何 chunk"时才回退到一次性调用（兼容不支持流式的供应商）。
             # 若已经收到部分 chunk 再失败，重发会导致重复计费/重复输出，故直接抛出。
-            if aggregated is None and not _is_timeout_error(e):
-                return self.model.invoke(self.memory.messages)
-            raise
+            if state["chunks"] == 0 and not _is_timeout_error(e):
+                return self._invoke_model(ctrl)
+            raise e
 
-        if aggregated is None:
-            return self.model.invoke(self.memory.messages)
+        if value is None:
+            # 流式未产出任何内容（部分供应商对空响应如此表现），回退一次性调用
+            return self._invoke_model(ctrl)
         # 聚合结果已是 AIMessageChunk，转换为 AIMessage 语义一致
-        return aggregated
+        return value
+
+    def _invoke_model(self, ctrl):
+        """非流式兜底调用（同样线程化，保证可中断、可超时）。"""
+        def _do_invoke(mark_first):
+            return self.model.invoke(self.memory.messages)
+
+        status, value = self._run_interruptible(
+            _do_invoke, ctrl,
+            first_byte_timeout=_models.FIRST_BYTE_TIMEOUT,
+            total_timeout=_models.TOTAL_TIMEOUT,
+            on_wait=self._make_wait_notifier(),
+        )
+        if status == "interrupted":
+            return None
+        if status == "timeout":
+            raise TimeoutError(
+                f"模型调用超时（{value}）。已放弃等待，可重试或切换模型（/model）。"
+            )
+        if status == "error":
+            raise value
+        return value
 
     def _invoke_tool(self, target_tool, fn_args, ctrl):
         """执行工具。run_bash 内部通过全局中断控制器实现命令级中断。"""

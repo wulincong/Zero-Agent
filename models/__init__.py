@@ -19,6 +19,8 @@ __all__ = [
     "DEFAULT_TEMPERATURE",
     "CONTEXT_MAX_CHARS",
     "CONTEXT_KEEP_RECENT",
+    "FIRST_BYTE_TIMEOUT",
+    "TOTAL_TIMEOUT",
 ]
 
 
