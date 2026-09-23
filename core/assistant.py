@@ -18,6 +18,15 @@ from core.prompts import SYSTEM_PROMPT
 
 class _Interrupted(Exception):
     """内部信号：表示用户中断了当前操作。"""
+
+
+def _is_timeout_error(exc: Exception) -> bool:
+    """判断异常是否为超时/网络类错误（此类错误不应盲目重发请求）。"""
+    name = type(exc).__name__.lower()
+    if "timeout" in name or "connect" in name:
+        return True
+    text = str(exc).lower()
+    return "timeout" in text or "timed out" in text
 from memory import ConversationMemory
 from models import DEFAULT_BASE_URL, build_model
 from runtime import PersistentBash
@@ -306,11 +315,15 @@ class InteractiveAssistant:
                 if ctrl.is_set():
                     return None
                 aggregated = chunk if aggregated is None else aggregated + chunk
-        except Exception:
-            # 流式失败时回退到一次性调用（保证兼容性）
+        except Exception as e:
+            # 中断优先：用户已按 Esc 时直接返回，不再重发请求。
             if ctrl.is_set():
                 return None
-            return self.model.invoke(self.memory.messages)
+            # 仅在"尚未收到任何 chunk"时才回退到一次性调用（兼容不支持流式的供应商）。
+            # 若已经收到部分 chunk 再失败，重发会导致重复计费/重复输出，故直接抛出。
+            if aggregated is None and not _is_timeout_error(e):
+                return self.model.invoke(self.memory.messages)
+            raise
 
         if aggregated is None:
             return self.model.invoke(self.memory.messages)
