@@ -60,6 +60,25 @@ def _is_interrupt_result(res) -> bool:
         return False
     return isinstance(res, str) and res.startswith(INTERRUPT_MARKER)
 
+
+def _tool_is_concurrent(tool) -> bool:
+    """判断工具是否可并发执行（阶段 4）。
+
+    读取工具对象上的 `_concurrency` 元数据（见 tools/builtin.py）：
+      - 显式标注 False 的工具（run_bash / install_skill / reload_self）
+        不可并发——它们分别共享 shell 会话、改技能注册表、改自身状态；
+      - 未标注的工具（技能库纯计算函数）默认可并发。
+
+    Args:
+        tool: 已注册的工具对象（StructuredTool 或裸可调用对象）。
+
+    Returns:
+        True 表示该工具可与其他可并发工具同批执行。
+    """
+    from tools.builtin import CONCURRENCY_ATTR
+
+    return bool(getattr(tool, CONCURRENCY_ATTR, True))
+
 # 技能库目录（相对项目根目录）
 SKILLS_DIR = os.path.abspath("./skills")
 os.makedirs(SKILLS_DIR, exist_ok=True)
@@ -441,53 +460,200 @@ class InteractiveAssistant:
                 if not ai_msg.tool_calls:
                     return ai_msg.content
 
-                # ---- 工具执行 ----
-                for call in ai_msg.tool_calls:
-                    # 用 consume() 消费中断（阶段 3）：一次 Esc 只响应一次，
-                    # 避免 bash 中断后标志残留导致重复 rollback。
-                    if ctrl.consume():
-                        await self._rollback(start_len, stage="tool")
-                        return "⏹️ 已中断（工具执行阶段）。已回到对话。"
+                # ---- 工具执行（阶段 4：并发执行 + 按原序回填）----
+                # 同一轮内的多个 tool_calls 中，可并发的工具（技能库纯计算函数）
+                # 会被合并成批次用 asyncio.gather 并发执行；不可并发的工具
+                # （run_bash / install_skill / reload_self）单独串行执行。
+                # 无论并发与否，结果都按 tool_calls 的原始顺序回填 memory，
+                # 否则模型会因结果错位而困惑。
+                results, interrupted = await self._run_tool_calls(
+                    ai_msg.tool_calls, ctrl
+                )
+                if interrupted:
+                    await self._rollback(start_len, stage="tool")
+                    return "⏹️ 已中断（工具执行阶段）。已回到对话。"
 
-                    fn_name = call["name"]
-                    fn_args = call["args"]
-
-                    # 参数已聚合完成，发布完整参数事件（工具名此前已流式提示过）
-                    await self.bus.emit(ToolCallEvent(name=fn_name, args=fn_args))
-
-                    target_tool = self.tools_registry.get(fn_name)
-                    if not target_tool:
-                        res = f"Error: 未找到工具 {fn_name}"
-                    else:
-                        if fn_name not in ["run_bash", "install_skill"]:
-                            print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
-                        try:
-                            # 工具统一以异步方式调用：
-                            # - 内置工具（run_bash 等）内部用 asyncio.to_thread 桥接阻塞 IO；
-                            # - 技能库纯计算函数由 langchain 的 ainvoke 在线程池中执行。
-                            res = await target_tool.ainvoke(fn_args)
-                        except _Interrupted:
-                            await self._rollback(start_len, stage="tool")
-                            return "⏹️ 已中断（工具执行阶段）。已回到对话。"
-                        except Exception as e:
-                            # 工具异常不中断对话，回填给模型让它自行纠错
-                            res = f"Error: 工具 {fn_name} 执行失败: {type(e).__name__}: {e}"
-                            print(f"⚠️ [工具异常]: {res}")
-
-                        # 工具内部被中断（如 run_bash 收到 Esc 后返回中断标记）：
-                        # 阶段 3 起不再把残缺结果写入历史，而是回滚本轮对话。
-                        # 否则历史里会残留"[已中断]"的 ToolMessage，模型下一轮
-                        # 会看到它并产生困惑（解决竞态 C）。
-                        if _is_interrupt_result(res):
-                            await self._rollback(start_len, stage="tool")
-                            return "⏹️ 已中断（工具执行阶段）。已回到对话。"
-
+                for call, res in results:
                     self.memory.add(ToolMessage(
                         content=str(res),
                         tool_call_id=call["id"]
                     ))
         finally:
             ctrl.stop()
+
+    async def _run_tool_calls(self, tool_calls, ctrl):
+        """执行一轮内的全部工具调用（阶段 4：并发 + 按原序回填）。
+
+        调度策略
+        --------
+        按 tool_calls 的原始顺序扫描，把**连续的可并发工具**聚成一个批次，
+        用 `asyncio.gather` 并发执行；遇到不可并发工具（run_bash /
+        install_skill / reload_self）则单独串行执行。批次之间保持顺序，
+        因此"并发"只发生在相邻的可并发工具之间，不会打乱与串行工具的
+        相对次序（例如 [技能A, run_bash, 技能B] 中 A 与 B 不会并发）。
+
+        结果顺序
+        --------
+        无论并发与否，返回值都按 tool_calls 的原始下标排序，
+        保证调用方按原序回填 memory（否则模型会因结果错位而困惑）。
+
+        中断处理
+        --------
+        每个批次开始前用 `ctrl.consume()` 检查中断（一次 Esc 只响应一次）。
+        批次执行期间若发生中断，会取消尚未完成的并发任务并返回
+        interrupted=True，由调用方回滚本轮对话。
+
+        Args:
+            tool_calls: 模型给出的工具调用列表（AIMessage.tool_calls）。
+            ctrl: 中断控制器。
+
+        Returns:
+            (results, interrupted)：
+                results 为 [(call, result_str), ...]，按原始顺序排列；
+                interrupted 为 True 表示执行期间被用户中断（results 无意义）。
+        """
+        n = len(tool_calls)
+        results = [None] * n  # 按原始下标占位，最后统一按序返回
+
+        # 先把每个调用解析为 (下标, call, tool, 是否可并发)
+        resolved = []
+        for idx, call in enumerate(tool_calls):
+            fn_name = call["name"]
+            target_tool = self.tools_registry.get(fn_name)
+            concurrent = target_tool is not None and _tool_is_concurrent(target_tool)
+            resolved.append((idx, call, target_tool, concurrent))
+
+        # 按"连续可并发"切分成批次：每个批次要么是单个不可并发工具，
+        # 要么是一段连续的可并发工具。
+        batches = []
+        current = []
+        for item in resolved:
+            if item[3]:  # 可并发
+                current.append(item)
+            else:  # 不可并发：先冲刷已积累的并发批次，再单独成批
+                if current:
+                    batches.append(current)
+                    current = []
+                batches.append([item])
+        if current:
+            batches.append(current)
+
+        for batch in batches:
+            # 批次开始前检查中断（阶段 3 语义：consume 一次只响应一次）
+            if ctrl.consume():
+                return [], True
+
+            if len(batch) == 1:
+                # 单个工具（含所有不可并发工具）：直接串行执行
+                idx, call, target_tool, _ = batch[0]
+                res, was_interrupted = await self._execute_one_tool(call, target_tool, ctrl)
+                if was_interrupted:
+                    return [], True
+                results[idx] = (call, res)
+            else:
+                # 多个可并发工具：并发执行，结果按各自下标回填
+                tasks = [
+                    asyncio.ensure_future(self._execute_one_tool(call, target_tool, ctrl))
+                    for (_, call, target_tool, _) in batch
+                ]
+                try:
+                    # 并发等待；期间轮询中断，命中则取消全部未完成任务
+                    done = await self._gather_with_interrupt(tasks, ctrl)
+                except _Interrupted:
+                    return [], True
+                for (idx, call, _, _), (res, was_interrupted) in zip(batch, done):
+                    if was_interrupted:
+                        return [], True
+                    results[idx] = (call, res)
+
+        return results, False
+
+    async def _gather_with_interrupt(self, tasks, ctrl):
+        """并发等待一组任务，同时支持 Esc 中断。
+
+        与 `_await_with_interrupt` 同源思路：以 50ms 为周期轮询中断标志，
+        命中则取消所有未完成任务并抛出 `_Interrupted`。
+
+        Args:
+            tasks: asyncio.Task 列表（每个返回 (result, was_interrupted)）。
+            ctrl: 中断控制器。
+
+        Returns:
+            与 tasks 等长的结果列表（顺序与 tasks 一致）。
+
+        Raises:
+            _Interrupted: 用户按 Esc 中断。
+        """
+        pending = set(tasks)
+        try:
+            while pending:
+                if ctrl.consume():
+                    for t in pending:
+                        t.cancel()
+                    await asyncio.gather(*pending, return_exceptions=True)
+                    raise _Interrupted()
+                done, pending = await asyncio.wait(pending, timeout=0.05)
+        except asyncio.CancelledError:
+            for t in pending:
+                t.cancel()
+            await asyncio.gather(*pending, return_exceptions=True)
+            raise
+        # 全部完成：按原顺序取结果
+        return [t.result() for t in tasks]
+
+    async def _execute_one_tool(self, call, target_tool, ctrl):
+        """执行单个工具调用，返回 (结果字符串, 是否被中断)。
+
+        本方法被设计为可安全并发调用（阶段 4）：它只读取共享状态、
+        不修改 memory，结果通过返回值交给调用方按序回填。
+
+        事件派发：工具调用事件（ToolCallEvent）与结果事件（ToolResultEvent）
+        都带当前会话代次（`bus.stamp`），使中断后残留的并发结果事件
+        被事件总线丢弃，不污染新一轮对话。
+
+        Args:
+            call: 单个工具调用（含 name / args / id）。
+            target_tool: 已注册的工具对象；None 表示未找到。
+            ctrl: 中断控制器。
+
+        Returns:
+            (res, was_interrupted)：
+                res 为工具返回的字符串（或错误描述）；
+                was_interrupted 为 True 表示工具内部被中断（如 run_bash 收到 Esc）。
+        """
+        fn_name = call["name"]
+        fn_args = call["args"]
+
+        # 参数已聚合完成，发布完整参数事件（工具名此前已流式提示过）。
+        # 打上当前代次，避免中断后残留事件污染下一轮。
+        await self.bus.emit(self.bus.stamp(ToolCallEvent(name=fn_name, args=fn_args)))
+
+        if target_tool is None:
+            return f"Error: 未找到工具 {fn_name}", False
+
+        if fn_name not in ["run_bash", "install_skill"]:
+            print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
+        try:
+            # 工具统一以异步方式调用：
+            # - 内置工具（run_bash 等）内部用 asyncio.to_thread 桥接阻塞 IO；
+            # - 技能库纯计算函数由 langchain 的 ainvoke 在线程池中执行。
+            res = await target_tool.ainvoke(fn_args)
+        except _Interrupted:
+            return "", True
+        except asyncio.CancelledError:
+            # 并发批次被中断时，未完成的任务会被 cancel，这里向上传播
+            raise
+        except Exception as e:
+            # 工具异常不中断对话，回填给模型让它自行纠错
+            res = f"Error: 工具 {fn_name} 执行失败: {type(e).__name__}: {e}"
+            print(f"⚠️ [工具异常]: {res}")
+
+        # 工具内部被中断（如 run_bash 收到 Esc 后返回中断标记）：
+        # 阶段 3 起不再把残缺结果写入历史，而是回滚本轮对话。
+        if _is_interrupt_result(res):
+            return "", True
+
+        return res, False
 
     @staticmethod
     def _make_wait_notifier(threshold: float = 5.0, interval: float = 15.0):

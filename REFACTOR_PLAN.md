@@ -15,10 +15,10 @@
 
 | 项 | 值 |
 |---|---|
-| 当前阶段 | **阶段 3 已完成，待用户验收** |
+| 当前阶段 | **阶段 4 已完成，待用户验收** |
 | 分支 | `feature/async-event-driven` |
 | 回滚锚点 | `v0.7.2-pre-async`（main 分支重构前状态） |
-| 最后更新 | 阶段 3 完成时 |
+| 最后更新 | 阶段 4 完成时 |
 
 ---
 
@@ -28,7 +28,7 @@
 - [x] **阶段 1**：事件总线（可热重载，行为等价）
 - [x] **阶段 2**：内核异步化（冷重启）
 - [x] **阶段 3**：中断事件化（冷重启）
-- [ ] **阶段 4**：并发工具执行
+- [x] **阶段 4**：并发工具执行
 - [ ] **阶段 5**：bash 原生异步化（独立一轮，暂不做）
 
 ---
@@ -44,7 +44,7 @@
 
 ## 进行中
 
-（无。阶段 3 已完成，等待用户验收后进入阶段 4。）
+（无。阶段 4 已完成，等待用户验收。）
 
 ### 阶段 1：事件总线（已完成）
 
@@ -170,21 +170,68 @@
 
 ---
 
-## 下一步
+## 已完成（续）
 
-**等待用户验收阶段 3。** 验收通过后进入阶段 4：
-
-### 阶段 4：并发工具执行
+### 阶段 4：并发工具执行（已完成）
 
 **目标**：同一轮内多个 tool_calls 并发执行，但结果按原顺序回填。
 
-**改动清单（待细化）**：
-- [ ] 读取工具的 `_concurrency` 元数据（阶段 2 已铺路，见 tools/builtin.py）
-- [ ] 可并发工具用 `asyncio.gather` 并发执行；不可并发工具（run_bash /
-      install_skill / reload_self）串行执行
-- [ ] 结果**按原 tool_calls 顺序重排**后回填 memory（否则模型困惑）
-- [ ] 并发结果事件用 `bus.stamp()` 打当前代次，避免中断后污染
-- [ ] 回归测试 + 打 tag `v0.7.6-concurrent-tools`
+**改动清单（全部完成）**：
+- [x] `core/assistant.py`：新增模块级 `_tool_is_concurrent(tool)`——读取工具
+      `_concurrency` 元数据（显式 False 不可并发；未标注的技能默认可并发）
+- [x] `core/assistant.py`：新增 `_run_tool_calls(tool_calls, ctrl)`——按原序扫描，
+      把**连续的可并发工具**聚成批次用 `asyncio.gather` 并发执行；
+      不可并发工具（run_bash / install_skill / reload_self）单独串行执行
+- [x] `core/assistant.py`：新增 `_gather_with_interrupt(tasks, ctrl)`——并发等待
+      一组任务，50ms 轮询中断，命中则取消全部未完成任务并抛 `_Interrupted`
+- [x] `core/assistant.py`：新增 `_execute_one_tool(call, tool, ctrl)`——执行单个工具，
+      返回 `(结果, 是否中断)`；只读共享状态、不改 memory，可安全并发调用
+- [x] `core/assistant.py`：`achat()` 工具循环改为调用 `_run_tool_calls`，
+      结果**按原 tool_calls 顺序**回填 memory
+- [x] `core/assistant.py`：`_execute_one_tool` 中 ToolCallEvent 用 `bus.stamp()`
+      打当前代次，避免中断后残留的并发结果事件污染下一轮
+- [x] 回归测试（见下）+ 打 tag `v0.7.6-concurrent-tools`
+
+**回归测试结果（全部通过）**：
+- 并发元数据判定：run_bash/install_skill/reload_self=False，技能=True ✅
+- 批次切分 + 按原序回填：[技能A, 技能B, run_bash, 技能A] 结果顺序正确 ✅
+- 真实并发：3×0.3s 任务总耗时 0.30s（< 0.6s，确认并发）✅
+- 不可并发串行：2×0.2s 任务总耗时 0.40s（>= 0.4s，确认串行）✅
+- 并发批次中断：0.20s 内取消全部任务 ✅
+- 批次前中断被消费（一次 Esc 只响应一次）✅
+- 工具异常隔离：单个工具抛异常不影响同批其它工具，结果按序回填 ✅
+- 未找到工具的错误处理 ✅
+- 端到端（真实模型）：一轮内 3 个工具调用，结果按原序回填，事件代次正确 ✅
+- 端到端中断：恰好 1 次 InterruptEvent + 1 次 RollbackEvent，历史干净，
+  下一轮正常 ✅
+- 热重载：bus 实例/订阅者保留，重载后并发执行 + 按序回填正常 ✅
+- `security/` 无任何改动 ✅
+
+**关键实现细节（阶段 5 需注意）**：
+- 并发只发生在**相邻**的可并发工具之间：`[技能A, run_bash, 技能B]` 中
+  A 与 B 不会并发（run_bash 把批次切断了）。这是刻意的保守设计，
+  保证与串行工具的相对次序不被打破。
+- `_execute_one_tool` 被设计为可安全并发：只读共享状态、不改 memory，
+  结果通过返回值交给调用方按序回填。
+- 并发批次被中断时，未完成的任务会被 `cancel()`；`_execute_one_tool` 中
+  `asyncio.CancelledError` 直接向上传播（不吞掉），由 `_gather_with_interrupt`
+  统一处理。
+- 流式阶段的 ToolCallEvent（仅工具名、无参数）**不带代次**，属预期；
+  只有参数聚合完成后的 ToolCallEvent（来自 `_execute_one_tool`）带代次。
+
+---
+
+## 下一步
+
+**等待用户验收阶段 4。** 验收通过后进入阶段 5：
+
+### 阶段 5：bash 原生异步化（独立一轮，暂不做）
+
+**目标**：把 `PersistentBash` 从"同步 + `asyncio.to_thread` 桥接"改为原生异步
+（`asyncio.create_subprocess_exec` + 非阻塞读取），彻底移除线程池依赖。
+
+**注意**：这是独立一轮的大改动，风险较高（bash 是唯一保留同步中断语义的模块），
+需单独评估后再动手。
 
 ---
 
