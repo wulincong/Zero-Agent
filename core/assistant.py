@@ -47,6 +47,19 @@ def _is_timeout_error(exc: Exception) -> bool:
     text = str(exc).lower()
     return "timeout" in text or "timed out" in text
 
+
+def _is_interrupt_result(res) -> bool:
+    """判断工具返回值是否表示"工具内部被用户中断"（阶段 3）。
+
+    目前只有 run_bash 会返回中断标记（见 runtime/bash.py 的 INTERRUPT_MARKER）。
+    内核据此回滚本轮对话，而不是把残缺结果写入历史。
+    """
+    try:
+        from runtime.bash import INTERRUPT_MARKER
+    except Exception:
+        return False
+    return isinstance(res, str) and res.startswith(INTERRUPT_MARKER)
+
 # 技能库目录（相对项目根目录）
 SKILLS_DIR = os.path.abspath("./skills")
 os.makedirs(SKILLS_DIR, exist_ok=True)
@@ -384,7 +397,14 @@ class InteractiveAssistant:
         from runtime.interrupt import get_interrupt
 
         ctrl = get_interrupt()
-        ctrl.clear()
+        # 消费掉上一轮可能残留的中断标志（阶段 3）：
+        # 用 consume() 而非 clear()，语义是"确认并清除"，避免把
+        # 上一轮的中断误当作本轮的中断，也避免吞掉真实中断。
+        ctrl.consume()
+
+        # 开启新一轮会话代次（阶段 3）：此后产生的事件都带本代次标识，
+        # 中断后残留的旧代次事件会被事件总线丢弃，不再污染新一轮对话。
+        self.bus.new_generation()
 
         # 记录本轮起始位置，便于中断时回滚，保证历史一致
         start_len = len(self.memory)
@@ -423,7 +443,9 @@ class InteractiveAssistant:
 
                 # ---- 工具执行 ----
                 for call in ai_msg.tool_calls:
-                    if ctrl.is_set():
+                    # 用 consume() 消费中断（阶段 3）：一次 Esc 只响应一次，
+                    # 避免 bash 中断后标志残留导致重复 rollback。
+                    if ctrl.consume():
                         await self._rollback(start_len, stage="tool")
                         return "⏹️ 已中断（工具执行阶段）。已回到对话。"
 
@@ -451,6 +473,14 @@ class InteractiveAssistant:
                             # 工具异常不中断对话，回填给模型让它自行纠错
                             res = f"Error: 工具 {fn_name} 执行失败: {type(e).__name__}: {e}"
                             print(f"⚠️ [工具异常]: {res}")
+
+                        # 工具内部被中断（如 run_bash 收到 Esc 后返回中断标记）：
+                        # 阶段 3 起不再把残缺结果写入历史，而是回滚本轮对话。
+                        # 否则历史里会残留"[已中断]"的 ToolMessage，模型下一轮
+                        # 会看到它并产生困惑（解决竞态 C）。
+                        if _is_interrupt_result(res):
+                            await self._rollback(start_len, stage="tool")
+                            return "⏹️ 已中断（工具执行阶段）。已回到对话。"
 
                     self.memory.add(ToolMessage(
                         content=str(res),
@@ -519,7 +549,9 @@ class InteractiveAssistant:
             while True:
                 if task.done():
                     break
-                if ctrl.is_set():
+                # 用 consume() 消费中断（阶段 3）：读取即清除，
+                # 保证同一次 Esc 不会被后续的 is_set()/consume() 重复响应。
+                if ctrl.consume():
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                     return "interrupted", None

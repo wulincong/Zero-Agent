@@ -21,6 +21,16 @@
 - 阶段 1（同步内核）使用 `emit_sync`；
 - 阶段 2（异步内核）改用 `await emit`。
 两者派发逻辑一致，仅调用方式不同。
+
+会话代次（阶段 3 引入）
+----------------------
+中断/回滚后，工作线程可能仍有"在途事件"（如 `emit_threadsafe` 投递、
+尚未派发的 ToolResultEvent）。若不加区分地派发，会污染新一轮对话
+（例如打印出已被丢弃的工具输出）。
+
+为此引入**会话代次**：内核每轮 `achat()` 开始时调用 `new_generation()`
+递增代次，事件经 `stamp()` 打上代次标识；派发时 `_is_stale()` 会丢弃
+代次不符的旧事件。未开启代次或未打标识的事件不受影响（向后兼容）。
 """
 
 from __future__ import annotations
@@ -40,7 +50,8 @@ class Event:
 
     Attributes:
         timestamp: 事件产生时刻（time.time()），用于排序与审计。
-        session_id: 会话标识，用于区分不同轮次/中断后丢弃残留事件。
+        session_id: 会话代次标识（阶段 3 起由 EventBus.stamp 填充）。
+            用于区分不同轮次，使中断后残留的旧事件被丢弃。
     """
 
     timestamp: float = field(default_factory=time.time)
@@ -160,6 +171,10 @@ class EventBus:
         self._handlers: Dict[Type[Event], List[Callable[[Event], None]]] = {}
         # 绑定的 asyncio 事件循环（供 emit_threadsafe 从工作线程投递事件）
         self._loop = None
+        # 当前会话代次（阶段 3 引入）：用于丢弃中断后残留的旧事件。
+        # 每轮对话开始时由内核调用 new_generation() 递增；
+        # 派发时若事件带 session_id 且与当前代次不符，则丢弃（见 _is_stale）。
+        self._generation: str = ""
 
     def subscribe(self, event_type: Type[Event],
                   handler: Callable[[Event], None]) -> None:
@@ -198,6 +213,8 @@ class EventBus:
         顺序调用所有订阅者；单个订阅者抛异常不影响其它订阅者
         （异常被吞掉并打印，避免一个坏订阅者拖垮整个对话）。
         """
+        if self._is_stale(event):
+            return
         for handler in self._handlers.get(type(event), []):
             try:
                 result = handler(event)
@@ -214,6 +231,8 @@ class EventBus:
         顺序 await 所有订阅者；同步订阅者直接调用，async 订阅者被 await。
         同样保证单个订阅者异常不影响其它订阅者。
         """
+        if self._is_stale(event):
+            return
         for handler in self._handlers.get(type(event), []):
             try:
                 result = handler(event)
@@ -262,6 +281,49 @@ class EventBus:
         投递到哪个循环。热重载保留 bus 实例，因此绑定关系不会丢失。
         """
         self._loop = loop
+
+    # ------------------------------------------------------------------
+    # 会话代次（阶段 3 引入）：丢弃中断后残留的旧事件
+    # ------------------------------------------------------------------
+    def new_generation(self) -> str:
+        """开启新的一轮会话代次，返回新的代次标识。
+
+        由内核在每轮 `achat()` 开始时调用。此后产生的事件应带上该标识
+        （见 `stamp`）。中断/回滚后，上一代次残留的事件（如工作线程
+        通过 `emit_threadsafe` 投递、但尚未派发的 ToolResultEvent）
+        会被 `_is_stale` 判定为过期并丢弃，避免污染新一轮对话。
+        """
+        self._generation = f"gen-{time.time_ns()}"
+        return self._generation
+
+    @property
+    def generation(self) -> str:
+        """当前会话代次标识（空串表示尚未开启代次，此时不做过滤）。"""
+        return self._generation
+
+    def stamp(self, event: Event) -> Event:
+        """给事件打上当前代次标识（若事件尚未带 session_id）。
+
+        内核在 emit 前调用，使事件可被代次过滤。已带 session_id 的事件
+        （如工作线程中提前构造的）保持原值不变。
+        """
+        if not event.session_id:
+            event.session_id = self._generation
+        return event
+
+    def _is_stale(self, event: Event) -> bool:
+        """判断事件是否属于已过期的旧代次（应被丢弃）。
+
+        规则：仅当"总线已开启代次"且"事件带 session_id"且"两者不符"时，
+        判定为过期。这样：
+          - 未开启代次（如单元测试直接 emit）时不过滤，保持向后兼容；
+          - 未打标识的事件（session_id 为空）不过滤，避免误伤。
+        """
+        if not self._generation:
+            return False
+        if not event.session_id:
+            return False
+        return event.session_id != self._generation
 
 
 def _is_awaitable(obj: Any) -> bool:

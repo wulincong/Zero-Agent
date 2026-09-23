@@ -21,6 +21,11 @@ from security import Decision, check_command
 # 单条命令的默认超时（秒），由 config.toml 的 [shell].timeout 控制
 DEFAULT_TIMEOUT = _config.get_int("shell.timeout", 180)
 
+# 中断标记（阶段 3）：命令被 Esc 中断时，返回值以此前缀开头。
+# 内核（core/assistant.py）据此判定"工具被中断"，从而回滚本轮对话，
+# 而不是把"[已中断]"这样的残缺结果写入历史（否则模型下一轮会看到它）。
+INTERRUPT_MARKER = "__AGENT_INTERRUPTED__\n"
+
 
 class PersistentBash:
     """常驻 bash 会话。"""
@@ -92,8 +97,10 @@ class PersistentBash:
             if remaining <= 0:
                 timed_out = True
                 break
-            # 用户按 Esc：向 bash 子进程发送 SIGINT，打断当前前台命令
-            if ctrl.is_set():
+            # 用户按 Esc：向 bash 子进程发送 SIGINT，打断当前前台命令。
+            # 阶段 3 起用 consume() 消费中断标志：读取即清除，
+            # 避免标志残留到主循环导致重复 rollback（见 REFACTOR_PLAN 阶段 3）。
+            if ctrl.consume():
                 interrupted = True
                 self._send_sigint()
                 # 给子进程一点时间响应，再收集残留输出
@@ -118,7 +125,9 @@ class PersistentBash:
             # 中断后命令可能仍在运行，为保持会话干净，重启 bash。
             self._restart()
             out += "\n[已中断] 用户按 Esc 中止了该命令，shell 会话已重置。"
-            return out
+            # 结构化标记（阶段 3）：内核据此识别"工具被中断"，
+            # 从而回滚本轮而非把中断结果写入历史（解决竞态 C）。
+            return INTERRUPT_MARKER + out
         if timed_out:
             # 挂起的命令仍在占用 stdin/stdout，会污染后续命令。
             # 直接重启 bash 会话，保证后续命令干净可用（代价是丢失 cd/env 状态）。

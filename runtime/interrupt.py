@@ -53,6 +53,30 @@ class InterruptController:
     def clear(self) -> None:
         self._flag.clear()
 
+    def consume(self) -> bool:
+        """读取并**清除**中断标志（原子操作），返回此前是否处于中断态。
+
+        阶段 3 引入。中断是"一次性事件"而非"持续状态"：
+        同一个 Esc 只应被响应一次。若用 is_set() 判断后不清除，
+        中断标志会残留到下一轮对话，导致：
+          - bash 中断后回到主循环，for 循环开头再次 is_set() 为真，
+            触发重复 rollback 与重复的"已中断"提示；
+          - 下一轮 achat 开头虽会 clear()，但若中断发生在
+            clear() 与 start() 之间，真实中断会被吞掉。
+
+        用 consume() 取代"is_set() + 事后 clear()"的组合，
+        保证一次中断只被消费一次，消除上述竞态。
+
+        Returns:
+            True 表示本次调用前标志已置位（即确实发生了一次中断）。
+        """
+        # threading.Event 无原子 test-and-clear，用锁保证读-清不可分割
+        with self._lock:
+            was_set = self._flag.is_set()
+            if was_set:
+                self._flag.clear()
+            return was_set
+
     # ------------------------------------------------------------------
     # 监听生命周期
     # ------------------------------------------------------------------
