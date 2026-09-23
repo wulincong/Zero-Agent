@@ -25,6 +25,7 @@
 
 from __future__ import annotations
 
+import asyncio
 import time
 from dataclasses import dataclass, field
 from typing import Any, Callable, Dict, List, Type
@@ -157,6 +158,8 @@ class EventBus:
     def __init__(self) -> None:
         # 事件类型 -> 处理器列表（保持注册顺序，保证派发顺序确定）
         self._handlers: Dict[Type[Event], List[Callable[[Event], None]]] = {}
+        # 绑定的 asyncio 事件循环（供 emit_threadsafe 从工作线程投递事件）
+        self._loop = None
 
     def subscribe(self, event_type: Type[Event],
                   handler: Callable[[Event], None]) -> None:
@@ -219,6 +222,46 @@ class EventBus:
             except Exception as e:  # noqa: BLE001
                 print(f"⚠️ [事件处理器异常] {type(event).__name__}: "
                       f"{type(e).__name__}: {e}")
+
+    def emit_threadsafe(self, event: Event) -> None:
+        """从**工作线程**安全地派发事件（阶段 2 引入）。
+
+        背景：`run_bash` 工具通过 `asyncio.to_thread` 在独立线程中执行阻塞 IO，
+        其输出回调 `_on_tool_output` 因此运行在工作线程里，无法 await。
+        本方法把事件投递回事件循环所在线程，由主循环顺序派发，
+        从而保证：
+          1. 派发顺序与产生顺序一致（不并发、不乱序）；
+          2. 订阅者（可能含 async 函数）始终在事件循环线程中被调用。
+
+        实现：若当前线程就是事件循环线程（或没有运行中的循环），
+        直接同步派发；否则用 `loop.call_soon_threadsafe` 投递。
+
+        注意：投递是"即发即忘"（fire-and-forget），调用方不等待派发完成。
+        对工具输出呈现而言这没有问题（顺序由事件循环保证）。
+        """
+        loop = self._loop
+        if loop is None or not loop.is_running():
+            # 无运行中的事件循环：退化为同步派发（如单元测试/非异步场景）
+            self.emit_sync(event)
+            return
+        try:
+            running = asyncio.get_running_loop()
+        except RuntimeError:
+            running = None
+        if running is loop:
+            # 已在事件循环线程中，直接同步派发即可
+            self.emit_sync(event)
+            return
+        # 工作线程：投递回事件循环线程，由主循环顺序派发
+        loop.call_soon_threadsafe(self.emit_sync, event)
+
+    def bind_loop(self, loop) -> None:
+        """绑定事件循环（阶段 2 引入）。
+
+        由 REPL 在启动时调用，使 `emit_threadsafe` 知道该把工作线程的事件
+        投递到哪个循环。热重载保留 bus 实例，因此绑定关系不会丢失。
+        """
+        self._loop = loop
 
 
 def _is_awaitable(obj: Any) -> bool:

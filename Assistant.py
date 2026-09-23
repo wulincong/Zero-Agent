@@ -4,6 +4,7 @@
 各层实现分别位于 core/ runtime/ tools/ memory/ models/ security/ cli/。
 """
 
+import asyncio
 import os
 import sys
 
@@ -13,7 +14,7 @@ from dotenv import load_dotenv
 _ENV_FILE = "." + "env"
 load_dotenv(os.path.join(os.path.dirname(os.path.abspath(__file__)), _ENV_FILE))
 
-from cli import run_repl  # noqa: E402
+from cli import arun_repl  # noqa: E402
 from core import InteractiveAssistant  # noqa: E402
 from models import DEFAULT_PROFILE, MODEL_PROFILES, resolve_api_key  # noqa: E402
 
@@ -33,7 +34,11 @@ def main() -> None:
         )
 
     assistant = InteractiveAssistant(api_key=None)
-    run_repl(assistant)
+    try:
+        asyncio.run(arun_repl(assistant))
+    except KeyboardInterrupt:
+        # Ctrl+C 在事件循环外触发时优雅退出
+        print("\n👋 再见！环境与技能已保存。")
 
 
 if __name__ == "__main__":

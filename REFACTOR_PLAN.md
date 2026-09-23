@@ -15,10 +15,10 @@
 
 | 项 | 值 |
 |---|---|
-| 当前阶段 | **阶段 1 已完成，待用户验收** |
+| 当前阶段 | **阶段 2 已完成，待用户验收** |
 | 分支 | `feature/async-event-driven` |
 | 回滚锚点 | `v0.7.2-pre-async`（main 分支重构前状态） |
-| 最后更新 | 阶段 1 完成时 |
+| 最后更新 | 阶段 2 完成时 |
 
 ---
 
@@ -26,7 +26,7 @@
 
 - [x] **阶段 0**：打标签 + 建分支 + 写本计划文件
 - [x] **阶段 1**：事件总线（可热重载，行为等价）
-- [ ] **阶段 2**：内核异步化（冷重启）
+- [x] **阶段 2**：内核异步化（冷重启）
 - [ ] **阶段 3**：中断事件化（冷重启）
 - [ ] **阶段 4**：并发工具执行
 - [ ] **阶段 5**：bash 原生异步化（独立一轮，暂不做）
@@ -44,7 +44,7 @@
 
 ## 进行中
 
-（无。阶段 1 已完成，等待用户验收后进入阶段 2。）
+（无。阶段 2 已完成，等待用户验收后进入阶段 3。）
 
 ### 阶段 1：事件总线（已完成）
 
@@ -69,28 +69,67 @@
 
 ---
 
-## 下一步
+## 已完成（续）
 
-**等待用户验收阶段 1。** 验收通过后进入阶段 2：
-
-### 阶段 2：内核异步化（需冷重启）
+### 阶段 2：内核异步化（已完成）
 
 **目标**：`chat()` → `async def achat()`，模型调用改用 `astream` / `ainvoke`。
 
-**改动清单**：
-- [ ] `core/assistant.py`：`chat` → `achat`；`_stream_model` → `_astream_model`（用 `self.model.astream`）
-- [ ] `core/assistant.py`：`_invoke_model` → `_ainvoke_model`（用 `self.model.ainvoke`）
-- [ ] `core/assistant.py`：**删除 `_run_interruptible()`**（约 90 行线程化调用器，异步下不再需要）
-- [ ] `core/assistant.py`：超时改用 `asyncio.wait_for` / 首字节计时
-- [ ] `core/assistant.py`：**移除 `on_tool_call` / `on_tool_output` 回调参数**，统一走事件总线
-- [ ] `core/assistant.py`：事件派发从 `emit_sync` 改为 `await self.bus.emit(...)`
-- [ ] `tools/builtin.py`：`run_bash` 工具改 `async def`，内部 `asyncio.to_thread(bash.run, ...)`
-- [ ] `tools/builtin.py`：工具注册加"可并发"元数据（为阶段 4 铺路）
-- [ ] `cli/repl.py`：`run_repl` → `async def arun_repl`；`_read_input` → `await session.prompt_async(...)`
-- [ ] `Assistant.py`：`main()` → `asyncio.run(arun_repl(assistant))`
-- [ ] 回归测试 + 打 tag `v0.7.4-async-core`
+**改动清单（全部完成）**：
+- [x] `core/assistant.py`：`chat` → `achat`；`_stream_model` → `_astream_model`（用 `self.model.astream`）
+- [x] `core/assistant.py`：`_invoke_model` → `_ainvoke_model`（用 `self.model.ainvoke`）
+- [x] `core/assistant.py`：**删除 `_run_interruptible()`**（约 90 行线程化调用器）
+- [x] `core/assistant.py`：新增 `_await_with_interrupt()`——原生 asyncio 版中断/超时等待器
+      （把调用包成 Task，50ms 轮询中断标志 + 首字节/整体超时，超时后 cancel）
+- [x] `core/assistant.py`：**移除 `on_tool_call` / `on_tool_output` 回调参数**，统一走事件总线
+- [x] `core/assistant.py`：事件派发从 `emit_sync` 改为 `await self.bus.emit(...)`
+- [x] `core/assistant.py`：`_rollback` 改 async，并发布 `RollbackEvent` / `InterruptEvent`
+- [x] `core/assistant.py`：`_confirm_command` 改用同步版 `_read_input_sync`
+      （确认发生在 run_bash 的工作线程中，无事件循环）
+- [x] `core/events.py`：新增 `emit_threadsafe()` + `bind_loop()`——工作线程事件投递回循环
+- [x] `tools/builtin.py`：`run_bash` 改 `async def`，内部 `asyncio.to_thread(bash.run, ...)`
+- [x] `tools/builtin.py`：三个内置工具加 `_concurrency=False` 元数据（为阶段 4 铺路）
+- [x] `cli/repl.py`：`run_repl` → `async def arun_repl`；`_read_input` → `await prompt_async(...)`
+- [x] `cli/repl.py`：新增 `_read_input_sync`（供工作线程确认流程）
+- [x] `cli/repl.py`：`arun_repl` 启动时 `bus.bind_loop(asyncio.get_running_loop())`
+- [x] `Assistant.py`：`main()` → `asyncio.run(arun_repl(assistant))`
+- [x] 回归测试（见下）+ 打 tag `v0.7.4-async-core`
 
-**注意**：阶段 2 涉及状态结构变更，**热重载救不了，必须冷重启进程**。
+**回归测试结果（全部通过）**：
+- 真实模型端到端：流式 + run_bash 工具调用 + 结果回填 + 多轮上下文 ✅
+- 事件顺序：UserMessage → ModelStart → ToolCall(名) → ModelEnd → ToolCall(参数)
+  → ToolResult → ModelStart → ModelChunk → ModelEnd ✅
+- Esc 中断：流被 cancel，用户消息回滚，历史干净 ✅
+- 超时：首字节超时触发，回滚，报错清晰 ✅
+- `emit_threadsafe`：工作线程事件正确投递到主循环线程 ✅
+- 热重载：bus 实例、loop 绑定、订阅者全部保留，重载后 achat 正常 ✅
+- 安全策略：CONFIRM 允许/拒绝、DENY 拦截均正常 ✅
+- 交互式确认（stdin）：工作线程中 `_read_input_sync` 正常 ✅
+- install_skill / reload_self 工具：正常 ✅
+
+**关键实现细节（阶段 3 需注意）**：
+- 中断/超时统一由 `_await_with_interrupt` 处理：把协程包成 Task，
+  轮询 `ctrl.is_set()` 与超时阈值，命中则 `task.cancel()`。
+- `InterruptEvent` 只由 `_rollback` 发布（避免重复）。
+- `run_bash` 的输出回调在工作线程中执行，必须用 `bus.emit_threadsafe`；
+  该路径依赖 `bus.bind_loop()` 已绑定事件循环（由 `arun_repl` 完成）。
+- 热重载保留 bus 实例，因此 loop 绑定与订阅者不会丢失（已验证）。
+
+---
+
+## 下一步
+
+**等待用户验收阶段 2。** 验收通过后进入阶段 3：
+
+### 阶段 3：中断事件化（需冷重启）
+
+**目标**：把 Esc 中断从"轮询标志"改为"事件驱动"，并解决中断竞态。
+
+**改动清单（待细化）**：
+- [ ] 中断竞态：事件队列里残留的旧事件在中断后需丢弃
+      （考虑用 `session_id` 或 generation 计数器标记，Event 基类已预留 `session_id` 字段）
+- [ ] 评估是否把 `InterruptController` 的轮询改为 asyncio 事件/信号驱动
+- [ ] 回归测试 + 打 tag `v0.7.5-interrupt-events`
 
 ---
 
@@ -119,10 +158,10 @@
 
 ## 已知问题 / 待办
 
-- 阶段 2 后热重载机制可能与 async 不兼容（事件循环引用失效），
-  需评估是否要改 `reload_code()`。
+- ~~阶段 2 后热重载机制可能与 async 不兼容（事件循环引用失效）~~
+  → **已解决**：热重载保留 bus 实例，loop 绑定与订阅者随之保留（已验证）。
 - 阶段 3 中断竞态：事件队列里残留的旧事件在中断后需丢弃
-  （考虑用 `session_id` 或 generation 计数器标记）。
+  （考虑用 `session_id` 或 generation 计数器标记；Event 基类已预留 `session_id`）。
 
 ---
 

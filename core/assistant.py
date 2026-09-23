@@ -6,18 +6,24 @@
 - 提供热重载能力（原地刷新代码，保留上下文与 shell 会话）。
 """
 
+import asyncio
 import glob
 import importlib.util
 import os
 import sys
 import time
 
-from langchain_core.messages import SystemMessage
-
 from core.events import (
     EventBus,
+    ErrorEvent,
+    InterruptEvent,
+    ModelChunkEvent,
+    ModelEndEvent,
+    ModelStartEvent,
+    RollbackEvent,
     ToolCallEvent,
     ToolResultEvent,
+    UserMessageEvent,
 )
 from core.prompts import SYSTEM_PROMPT
 
@@ -70,7 +76,8 @@ class InteractiveAssistant:
         self.bash = PersistentBash(confirm_callback=self._confirm_command)
         self.tools_registry = {}
         # 事件总线：内核只负责 emit，CLI/日志等外部通过 subscribe 订阅。
-        # 阶段 1 用 emit_sync 派发；阶段 2 异步化后改用 await emit。
+        # 阶段 2 起统一用 await bus.emit(...) 顺序派发；
+        # 工作线程（run_bash）产生的事件用 bus.emit_threadsafe(...) 投递回循环。
         self.bus = EventBus()
         # 常驻对话历史：首条固定为系统提示词（自我认知），后续为对话消息
         self.memory = ConversationMemory(
@@ -107,8 +114,10 @@ class InteractiveAssistant:
         ctrl = get_interrupt()
         ctrl.stop()
         try:
-            from cli.repl import _read_input
-            ans = _read_input("是否执行？[y/N] > ").strip().lower()
+            # 本方法运行在 run_bash 的工作线程中（无事件循环），
+            # 故使用同步版输入函数。
+            from cli.repl import _read_input_sync
+            ans = _read_input_sync("是否执行？[y/N] > ").strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
         finally:
@@ -131,20 +140,16 @@ class InteractiveAssistant:
     def _on_tool_output(self, command: str, output: str) -> None:
         """run_bash 的输出回调：发布 ToolResultEvent 到事件总线。
 
-        由 chat() 在每轮对话开始时设置 self._tool_output_handler，
-        使 CLI 能决定如何呈现（如折叠）。未设置时回退为直接打印。
+        阶段 2 起统一走事件总线：内核不再持有 CLI 的临时回调，
+        由 CLI 在启动时订阅 ToolResultEvent 决定如何呈现（如折叠）。
 
-        阶段 1 说明：为保持行为逐字节等价，这里仍优先走 _tool_output_handler
-        （由 chat() 注入的临时处理器）；仅当未注入时才发布事件。
-        阶段 2 起将统一改为发布事件、由 CLI 订阅。
+        注意：本方法由 run_bash 工具在**工作线程**中调用（见 tools/builtin.py
+        的 asyncio.to_thread），因此这里不能 await，只能同步派发。
+        事件总线为此提供了线程安全的 `emit_threadsafe`。
         """
-        handler = getattr(self, "_tool_output_handler", None)
-        if handler is not None:
-            handler(command, output)
-        else:
-            self.bus.emit_sync(ToolResultEvent(
-                name="run_bash", command=command, result=output,
-            ))
+        self.bus.emit_threadsafe(ToolResultEvent(
+            name="run_bash", command=command, result=output,
+        ))
 
     def _register_builtin_tools(self):
         self.register_tool(make_bash_tool(self.bash, on_output=self._on_tool_output))
@@ -353,18 +358,23 @@ class InteractiveAssistant:
         )
 
     # ------------------------------------------------------------------
-    # 对话驱动
+    # 对话驱动（异步）
     # ------------------------------------------------------------------
-    def chat(self, user_input: str, on_tool_call=None, on_tool_output=None) -> str:
-        """多轮对话单步驱动器（支持 Esc 中断）。
+    async def achat(self, user_input: str) -> str:
+        """多轮对话单步驱动器（异步，支持 Esc 中断）。
+
+        阶段 2 起本方法为 async：模型调用改用原生 `astream` / `ainvoke`，
+        不再需要线程化调用器（_run_interruptible 已删除）。
+        中断通过 `asyncio.wait_for` + 中断标志轮询实现，超时用 asyncio 原生机制。
+
+        事件派发：所有状态变化都通过 `await self.bus.emit(...)` 顺序派发，
+        CLI 通过订阅事件决定如何呈现（不再有 on_tool_call / on_tool_output 回调）。
 
         Args:
-            on_tool_call: 可选回调，用于工具调用流式提示。
-                签名 on_tool_call(name, args=None)：
-                - 模型刚决定调用工具时，以 (name, None) 调用（参数尚未生成）；
-                - 参数聚合完成后，以 (name, args) 再次调用。
-            on_tool_output: 可选回调 on_tool_output(command, output)，
-                用于接管 run_bash 的命令回显与输出呈现（如折叠）。
+            user_input: 用户本轮输入。
+
+        Returns:
+            面向用户的回复文本（模型输出或中断/错误提示）。
         """
         # 兜底：确保系统提示词始终位于对话历史首位（热重载/异常后自愈）
         self.memory.ensure_system_prompt()
@@ -379,34 +389,34 @@ class InteractiveAssistant:
         # 记录本轮起始位置，便于中断时回滚，保证历史一致
         start_len = len(self.memory)
         self.memory.add_user(user_input)
-
-        # 设置本轮的工具输出处理器，供 run_bash 回调使用
-        self._tool_output_handler = on_tool_output
+        await self.bus.emit(UserMessageEvent(content=user_input))
 
         ctrl.start()  # 启动 Esc 监听（仅 TTY 下生效）
         try:
             while True:
                 # ---- 模型调用（流式，便于及时响应中断）----
                 try:
-                    ai_msg = self._stream_model(ctrl, on_tool_call=on_tool_call)
+                    ai_msg = await self._astream_model(ctrl)
                 except _Interrupted:
-                    self._rollback(start_len)
+                    await self._rollback(start_len, stage="model")
                     return "⏹️ 已中断（模型调用阶段）。已回到对话。"
                 except TimeoutError as e:
-                    self._rollback(start_len)
+                    await self._rollback(start_len, stage="model")
                     return (
                         f"⏱️ 模型调用超时：{e}\n"
                         f"   可重试，或用 /model 切换到其它模型。"
                     )
                 except Exception as e:
-                    self._rollback(start_len)
+                    await self._rollback(start_len, stage="model")
+                    await self.bus.emit(ErrorEvent(stage="model", error=e))
                     return f"❌ 模型调用失败: {type(e).__name__}: {e}"
 
                 if ai_msg is None:  # 被中断
-                    self._rollback(start_len)
+                    await self._rollback(start_len, stage="model")
                     return "⏹️ 已中断（模型调用阶段）。已回到对话。"
 
                 self.memory.add(ai_msg)
+                await self.bus.emit(ModelEndEvent(message=ai_msg))
 
                 if not ai_msg.tool_calls:
                     return ai_msg.content
@@ -414,18 +424,14 @@ class InteractiveAssistant:
                 # ---- 工具执行 ----
                 for call in ai_msg.tool_calls:
                     if ctrl.is_set():
-                        self._rollback(start_len)
+                        await self._rollback(start_len, stage="tool")
                         return "⏹️ 已中断（工具执行阶段）。已回到对话。"
 
                     fn_name = call["name"]
                     fn_args = call["args"]
 
-                    # 参数已聚合完成，通知显示完整参数（工具名此前已流式提示过）
-                    # 互斥规则：有临时回调时走回调，否则发布事件（避免重复打印）
-                    if on_tool_call:
-                        on_tool_call(fn_name, fn_args)
-                    else:
-                        self.bus.emit_sync(ToolCallEvent(name=fn_name, args=fn_args))
+                    # 参数已聚合完成，发布完整参数事件（工具名此前已流式提示过）
+                    await self.bus.emit(ToolCallEvent(name=fn_name, args=fn_args))
 
                     target_tool = self.tools_registry.get(fn_name)
                     if not target_tool:
@@ -434,10 +440,12 @@ class InteractiveAssistant:
                         if fn_name not in ["run_bash", "install_skill"]:
                             print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
                         try:
-                            # run_bash 内部通过全局中断控制器实现命令级中断
-                            res = target_tool.invoke(fn_args)
+                            # 工具统一以异步方式调用：
+                            # - 内置工具（run_bash 等）内部用 asyncio.to_thread 桥接阻塞 IO；
+                            # - 技能库纯计算函数由 langchain 的 ainvoke 在线程池中执行。
+                            res = await target_tool.ainvoke(fn_args)
                         except _Interrupted:
-                            self._rollback(start_len)
+                            await self._rollback(start_len, stage="tool")
                             return "⏹️ 已中断（工具执行阶段）。已回到对话。"
                         except Exception as e:
                             # 工具异常不中断对话，回填给模型让它自行纠错
@@ -449,7 +457,6 @@ class InteractiveAssistant:
                         tool_call_id=call["id"]
                     ))
         finally:
-            self._tool_output_handler = None
             ctrl.stop()
 
     @staticmethod
@@ -465,7 +472,7 @@ class InteractiveAssistant:
             interval: 之后每隔多少秒再提示一次（默认 15s）。
 
         Returns:
-            回调 on_wait(elapsed)，可安全传入 _run_interruptible。
+            回调 on_wait(elapsed)，可安全传入异步等待循环。
         """
         state = {"next": threshold}
 
@@ -480,133 +487,126 @@ class InteractiveAssistant:
 
         return on_wait
 
-    def _run_interruptible(self, fn, ctrl, *, first_byte_timeout=None,
-                           total_timeout=None, on_wait=None):
-        """在独立工作线程中执行阻塞调用，主线程轮询中断标志与超时。
+    async def _await_with_interrupt(self, coro, ctrl, *, first_byte_timeout=None,
+                                    total_timeout=None, on_wait=None,
+                                    first_byte_flag=None):
+        """在异步上下文中等待一个协程，同时支持 Esc 中断与超时。
 
-        为什么必须这样做：
-            模型 SDK 的 `stream()` / `invoke()` 是阻塞迭代。若服务端在
-            TCP 连接建立后迟迟不返回任何数据（半开连接、网关挂起等），
-            迭代器会一直阻塞在 socket read 上，**永远进不到循环体**，
-            因此循环体内的 `ctrl.is_set()` 检查形同虚设 —— 表现为
-            "卡死、Esc 无效、无任何报错"。
-
-            把调用放进工作线程后，主线程只负责轮询，即使底层 socket
-            完全 hang 住，也能在毫秒级响应 Esc，并在超时后主动放弃等待。
+        阶段 2 用原生 asyncio 取代了旧的线程化调用器（_run_interruptible）：
+        把模型调用包成一个 asyncio.Task，主协程以 50ms 为周期轮询中断标志、
+        首字节超时与整体超时。这样即使底层 socket 完全 hang 住，
+        Esc 也能在毫秒级生效，超时后也能主动放弃等待。
 
         Args:
-            fn: 无参可调用对象，在工作线程中执行，返回值经 result 传出。
+            coro: 待等待的协程对象（如 self._consume_stream(...)）。
             ctrl: 中断控制器（提供 is_set()）。
             first_byte_timeout: 首个数据到达前的最大等待秒数（None 表示不限）。
-                用于捕获"连上了但服务端不吐字"的场景。
             total_timeout: 整体最大等待秒数（None 表示不限）。
-            on_wait: 可选回调 on_wait(elapsed)，主线程在等待期间周期性调用，
-                用于向用户提示"仍在等待"，避免误以为程序卡死。
+            on_wait: 可选回调 on_wait(elapsed)，等待期间周期性调用。
+            first_byte_flag: 可选单元素列表（如 [False]），由被等待的协程在
+                收到首个数据时置为 True，用于实现首字节超时判定。
 
         Returns:
             (status, value)：
-                status == "ok"        -> value 为 fn 的返回值
+                status == "ok"          -> value 为协程返回值
                 status == "interrupted" -> 用户按 Esc
                 status == "timeout"     -> 超时（value 为超时描述）
-                status == "error"       -> value 为工作线程抛出的异常对象
+                status == "error"       -> value 为协程抛出的异常对象
         """
-        import threading
-
-        box = {"done": False, "value": None, "error": None, "first": False}
-        lock = threading.Lock()
-
-        def _mark_first():
-            with lock:
-                box["first"] = True
-
-        def _worker():
-            try:
-                box["value"] = fn(_mark_first)
-            except BaseException as e:  # noqa: BLE001 - 需捕获全部异常回传主线程
-                box["error"] = e
-            finally:
-                with lock:
-                    box["done"] = True
-
-        t = threading.Thread(target=_worker, name="model-call", daemon=True)
-        t.start()
-
+        task = asyncio.ensure_future(coro)
         start = time.monotonic()
-        while True:
-            with lock:
-                done = box["done"]
-                first = box["first"]
-            if done:
-                break
-            if ctrl.is_set():
-                return "interrupted", None
-            now = time.monotonic()
-            elapsed = now - start
-            if total_timeout is not None and elapsed > total_timeout:
-                return "timeout", f"整体等待超过 {total_timeout:.0f}s"
-            if (first_byte_timeout is not None and not first
-                    and elapsed > first_byte_timeout):
-                return "timeout", f"连接后 {first_byte_timeout:.0f}s 内未收到任何数据"
-            if on_wait is not None:
-                try:
-                    on_wait(elapsed)
-                except Exception:
-                    pass
-            time.sleep(0.05)
+        try:
+            while True:
+                if task.done():
+                    break
+                if ctrl.is_set():
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    return "interrupted", None
+                now = time.monotonic()
+                elapsed = now - start
+                if total_timeout is not None and elapsed > total_timeout:
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    return "timeout", f"整体等待超过 {total_timeout:g}s"
+                first = bool(first_byte_flag[0]) if first_byte_flag is not None else True
+                if (first_byte_timeout is not None and not first
+                        and elapsed > first_byte_timeout):
+                    task.cancel()
+                    await asyncio.gather(task, return_exceptions=True)
+                    return "timeout", f"连接后 {first_byte_timeout:g}s 内未收到任何数据"
+                if on_wait is not None:
+                    try:
+                        on_wait(elapsed)
+                    except Exception:
+                        pass
+                # 等待 task 完成或 50ms 超时（用于轮询中断/超时）
+                await asyncio.wait({task}, timeout=0.05)
+        except asyncio.CancelledError:
+            task.cancel()
+            await asyncio.gather(task, return_exceptions=True)
+            raise
 
-        if box["error"] is not None:
-            return "error", box["error"]
-        return "ok", box["value"]
+        if task.cancelled():
+            return "interrupted", None
+        exc = task.exception()
+        if exc is not None:
+            return "error", exc
+        return "ok", task.result()
 
-    def _stream_model(self, ctrl, on_tool_call=None):
-        """流式调用模型并聚合为完整 AIMessage；中断/超时返回 None。
+    async def _astream_model(self, ctrl):
+        """异步流式调用模型并聚合为完整 AIMessage；中断/超时返回 None。
 
-        实现要点：真正的网络调用跑在独立工作线程里（见 _run_interruptible），
-        主线程只做轮询，因此即使底层 socket 完全 hang 住，Esc 也能立即生效，
-        且超时后不会无限等待。
+        实现要点：真正的网络调用是原生异步的（`self.model.astream`），
+        由 `_await_with_interrupt` 负责轮询中断标志与超时，
+        因此即使底层 socket 完全 hang 住，Esc 也能立即生效。
 
         Args:
-            on_tool_call: 可选回调 on_tool_call(name, args=None)。
-                当模型开始生成工具调用时，以 (name, None) 实时通知，
-                便于 CLI 在模型"刚决定调用工具"时就给出提示。
-        """
-        from langchain_core.messages import AIMessageChunk
+            ctrl: 中断控制器。
 
+        Returns:
+            聚合后的 AIMessage（或 AIMessageChunk，语义一致）；
+            被中断时返回 None。
+        """
         # 首字节超时：连接建立后迟迟不吐字（服务端挂起）时及时失败。
         # 整体超时：给足长思考/长输出的空间，但兜底防止无限等待。
         first_byte_timeout = _models.FIRST_BYTE_TIMEOUT
         total_timeout = _models.TOTAL_TIMEOUT
 
         state = {"aggregated": None, "chunks": 0}
+        first_flag = [False]
         on_wait = self._make_wait_notifier()
 
-        def _do_stream(mark_first):
-            """在工作线程中执行流式调用，逐 chunk 聚合。"""
-            for chunk in self.model.stream(self.memory.messages):
-                mark_first()
+        await self.bus.emit(ModelStartEvent())
+
+        async def _consume():
+            """消费异步流，逐 chunk 聚合，并发布流式事件。"""
+            async for chunk in self.model.astream(self.memory.messages):
+                first_flag[0] = True
                 state["chunks"] += 1
                 # 工具调用流式：工具名一出现就通知（参数逐字符生成，此处不通知）
                 if getattr(chunk, "tool_call_chunks", None):
                     for tc in chunk.tool_call_chunks:
                         if tc.get("name"):
-                            # 工具名一出现就通知（参数尚未聚合）
-                            # 互斥规则：有临时回调时走回调，否则发布事件
-                            if on_tool_call:
-                                on_tool_call(tc["name"])
-                            else:
-                                self.bus.emit_sync(ToolCallEvent(name=tc["name"]))
+                            await self.bus.emit(ToolCallEvent(name=tc["name"]))
+                # 文本增量事件（供需要实时渲染的订阅者使用）
+                text = getattr(chunk, "content", "") or ""
+                if isinstance(text, str) and text:
+                    await self.bus.emit(ModelChunkEvent(text=text))
                 agg = state["aggregated"]
                 state["aggregated"] = chunk if agg is None else agg + chunk
             return state["aggregated"]
 
-        status, value = self._run_interruptible(
-            _do_stream, ctrl,
+        status, value = await self._await_with_interrupt(
+            _consume(), ctrl,
             first_byte_timeout=first_byte_timeout,
             total_timeout=total_timeout,
             on_wait=on_wait,
+            first_byte_flag=first_flag,
         )
 
         if status == "interrupted":
+            # 中断事件统一由 _rollback 发布（避免重复）
             return None
         if status == "timeout":
             raise TimeoutError(
@@ -621,27 +621,33 @@ class InteractiveAssistant:
             # 仅在"尚未收到任何 chunk"时才回退到一次性调用（兼容不支持流式的供应商）。
             # 若已经收到部分 chunk 再失败，重发会导致重复计费/重复输出，故直接抛出。
             if state["chunks"] == 0 and not _is_timeout_error(e):
-                return self._invoke_model(ctrl)
+                return await self._ainvoke_model(ctrl)
             raise e
 
         if value is None:
             # 流式未产出任何内容（部分供应商对空响应如此表现），回退一次性调用
-            return self._invoke_model(ctrl)
+            return await self._ainvoke_model(ctrl)
         # 聚合结果已是 AIMessageChunk，转换为 AIMessage 语义一致
         return value
 
-    def _invoke_model(self, ctrl):
-        """非流式兜底调用（同样线程化，保证可中断、可超时）。"""
-        def _do_invoke(mark_first):
-            return self.model.invoke(self.memory.messages)
+    async def _ainvoke_model(self, ctrl):
+        """非流式兜底调用（原生异步，同样可中断、可超时）。"""
+        first_flag = [False]
 
-        status, value = self._run_interruptible(
-            _do_invoke, ctrl,
+        async def _do_invoke():
+            result = await self.model.ainvoke(self.memory.messages)
+            first_flag[0] = True
+            return result
+
+        status, value = await self._await_with_interrupt(
+            _do_invoke(), ctrl,
             first_byte_timeout=_models.FIRST_BYTE_TIMEOUT,
             total_timeout=_models.TOTAL_TIMEOUT,
             on_wait=self._make_wait_notifier(),
+            first_byte_flag=first_flag,
         )
         if status == "interrupted":
+            # 中断事件统一由 _rollback 发布（避免重复）
             return None
         if status == "timeout":
             raise TimeoutError(
@@ -651,6 +657,11 @@ class InteractiveAssistant:
             raise value
         return value
 
-    def _rollback(self, start_len: int) -> None:
+    async def _rollback(self, start_len: int, stage: str = "") -> None:
         """回滚本轮对话产生的消息，保证历史一致（不残留残缺 tool_call）。"""
+        dropped = len(self.memory.messages) - start_len
         del self.memory.messages[start_len:]
+        if dropped > 0:
+            await self.bus.emit(RollbackEvent(dropped=dropped))
+        if stage:
+            await self.bus.emit(InterruptEvent(stage=stage))

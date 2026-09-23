@@ -7,6 +7,7 @@
 若 prompt_toolkit 不可用或非 TTY 环境，自动降级为内置 input()（仅单行）。
 """
 
+import asyncio
 import sys
 
 # ----------------------------------------------------------------------
@@ -102,7 +103,7 @@ def make_tool_output_handler():
 
 
 def register_event_subscribers(assistant) -> None:
-    """把 CLI 的呈现逻辑注册为事件订阅者（阶段 1 引入）。
+    """把 CLI 的呈现逻辑注册为事件订阅者。
 
     与旧的"回调工厂"相比，订阅方式让内核不再需要知道 CLI 的存在：
     内核只 emit 事件，CLI 决定怎么呈现。
@@ -111,10 +112,8 @@ def register_event_subscribers(assistant) -> None:
       - ToolCallEvent   -> 打印工具名 / 参数（复用 make_tool_call_printer 的格式）
       - ToolResultEvent -> 折叠输出（复用 make_tool_output_handler 的格式）
 
-    注意：阶段 1 为保持行为逐字节等价，chat() 仍会注入临时回调，
-    因此这里注册的订阅者与回调会同时存在。为避免重复打印，
-    订阅者仅在"无临时回调"时生效——由内核侧保证（见 _on_tool_output）。
-    本函数注册的订阅者主要用于：非 chat() 路径（如未来异步化后）的事件呈现。
+    阶段 2 起内核已移除 on_tool_call / on_tool_output 回调参数，
+    所有呈现统一走事件总线，因此这里注册的订阅者是唯一的呈现路径。
     """
     from core.events import ToolCallEvent, ToolResultEvent
 
@@ -284,8 +283,16 @@ def _build_session(assistant=None):
 _SESSION = None
 
 
-def _read_input(prompt: str, assistant=None) -> str:
-    """读取用户输入（支持多行），优先使用 prompt_toolkit。"""
+def _read_input_sync(prompt: str, assistant=None) -> str:
+    """同步读取用户输入（供工作线程中的确认流程使用）。
+
+    背景：危险命令的确认发生在 `run_bash` 的工作线程里（bash.run 由
+    asyncio.to_thread 执行），那里没有运行中的事件循环，无法 await。
+    因此这里提供同步版本，直接调用 prompt_toolkit 的阻塞式 prompt。
+
+    注意：调用方（_confirm_command）会先暂停 Esc 监听线程，
+    避免与 prompt_toolkit 争抢 stdin。
+    """
     global _SESSION
     if _SESSION is None:
         _SESSION = _build_session(assistant)
@@ -296,8 +303,28 @@ def _read_input(prompt: str, assistant=None) -> str:
             raise
         except KeyboardInterrupt:
             return ""
-    # 降级路径：仅单行
     return input(prompt)
+
+
+async def _read_input(prompt: str, assistant=None) -> str:
+    """异步读取用户输入（支持多行），优先使用 prompt_toolkit。
+
+    阶段 2 起为 async：使用 `prompt_async` 以免阻塞事件循环
+    （阻塞式 prompt 会让 asyncio 任务无法推进）。
+    降级路径（无 prompt_toolkit / 非 TTY）用 `asyncio.to_thread(input, ...)`。
+    """
+    global _SESSION
+    if _SESSION is None:
+        _SESSION = _build_session(assistant)
+    if _SESSION is not None:
+        try:
+            return await _SESSION.prompt_async(prompt, prompt_continuation="... ")
+        except EOFError:
+            raise
+        except KeyboardInterrupt:
+            return ""
+    # 降级路径：仅单行（放到线程池，避免阻塞事件循环）
+    return await asyncio.to_thread(input, prompt)
 
 
 def print_banner(assistant) -> None:
@@ -338,15 +365,25 @@ def _save_session_state(assistant) -> None:
         pass  # 保存失败不影响退出
 
 
-def run_repl(assistant) -> None:
-    """启动交互式 REPL，直到用户退出。"""
+async def arun_repl(assistant) -> None:
+    """启动交互式 REPL（异步），直到用户退出。
+
+    阶段 2 起为 async：主循环 await 内核的 `achat()`，
+    输入用 `prompt_async`，从而让事件循环在等待模型/工具时保持可响应。
+    """
     # 注册事件订阅者：内核 emit 事件，CLI 负责呈现
     register_event_subscribers(assistant)
+    # 把事件循环绑定到事件总线：run_bash 在工作线程中产生的事件
+    # 需要投递回本循环派发（见 EventBus.emit_threadsafe）
+    try:
+        assistant.bus.bind_loop(asyncio.get_running_loop())
+    except Exception:
+        pass
     print_banner(assistant)
     try:
         while True:
             try:
-                user_prompt = _read_input("\n👤 You > ", assistant).strip()
+                user_prompt = (await _read_input("\n👤 You > ", assistant)).strip()
             except EOFError:
                 _save_session_state(assistant)
                 print("\n👋 再见！环境与技能已保存。")
@@ -380,11 +417,7 @@ def run_repl(assistant) -> None:
             if user_prompt.lower() in ["/help", "/h"]:
                 print("\n" + HELP_TEXT)
                 continue
-            response = assistant.chat(
-                user_prompt,
-                on_tool_call=make_tool_call_printer(),
-                on_tool_output=make_tool_output_handler(),
-            )
+            response = await assistant.achat(user_prompt)
             render_markdown(response)
 
             if getattr(assistant, "_pending_reload", False):
