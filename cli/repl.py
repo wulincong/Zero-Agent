@@ -28,20 +28,17 @@ _DEFAULT_MAX_WIDTH = 100
 
 
 def _resolve_width() -> int | None:
-    """计算渲染宽度：min(终端宽度, 上限)。返回 None 表示不限制。"""
-    import os
+    """计算渲染宽度：min(终端宽度, 上限)。返回 None 表示不限制。
+
+    上限来自 config.toml 的 [cli].render_width（环境变量 AGENT_RENDER_WIDTH 可覆盖）。
+    """
     import shutil
 
-    raw = os.environ.get("AGENT_RENDER_WIDTH")
-    if raw is not None:
-        try:
-            limit = int(raw)
-        except ValueError:
-            limit = _DEFAULT_MAX_WIDTH
-        if limit <= 0:
-            return None
-    else:
-        limit = _DEFAULT_MAX_WIDTH
+    from core import config as _config
+
+    limit = _config.get_int("cli.render_width", _DEFAULT_MAX_WIDTH)
+    if limit <= 0:
+        return None
 
     term_cols = shutil.get_terminal_size(fallback=(80, 24)).columns
     return min(term_cols, limit)
@@ -122,6 +119,7 @@ HELP_TEXT = """\
    /reload  重新加载内核与安全模块（保留对话上下文与 shell 会话）
    /clear   清空对话上下文（仅保留系统提示词）
    /context 查看上下文占用（消息数 / 字符数 / 预算）
+   /config  查看当前生效的配置（来自 config.toml）
    /expand  展开最近一次工具输出（默认折叠）
    /help    显示本帮助
    exit/q   退出
@@ -138,7 +136,7 @@ HELP_TEXT = """\
 ⏱️  超时保护：
    模型调用若长时间无响应，会周期性提示"仍在响应中"；
    超过首字节超时（默认 60s）或整体超时（默认 300s）会自动放弃并报错，
-   不会无限卡死。可用 AGENT_FIRST_BYTE_TIMEOUT / AGENT_TOTAL_TIMEOUT 调整。"""
+   不会无限卡死。可在 config.toml 的 [timeout] 段调整。"""
 
 # ----------------------------------------------------------------------
 # 输入后端：优先 prompt_toolkit，失败则降级 input()
@@ -155,7 +153,7 @@ except Exception:  # pragma: no cover - 环境缺失时降级
 
 
 # 顶层指令（用于 Tab 补全）
-_COMMANDS = ["/model", "/reload", "/clear", "/context", "/expand", "/help", "exit", "quit"]
+_COMMANDS = ["/model", "/reload", "/clear", "/context", "/config", "/expand", "/help", "exit", "quit"]
 
 
 if _HAS_PTK:
@@ -282,6 +280,23 @@ def print_banner(assistant) -> None:
     print(BANNER)
 
 
+def _render_config() -> str:
+    """渲染当前生效的配置（来自 config.toml，含环境变量覆盖）。"""
+    from core import config as _config
+
+    data = _config.as_dict()
+    lines = [f"⚙️  当前配置（{_config.CONFIG_FILE}）"]
+    for section, values in data.items():
+        lines.append(f"  [{section}]")
+        if isinstance(values, dict):
+            for k, v in values.items():
+                lines.append(f"    {k} = {v}")
+        else:
+            lines.append(f"    {values}")
+    lines.append("\n修改 config.toml 后，用 /reload 即可生效（密钥仍在 .env）。")
+    return "\n".join(lines)
+
+
 def _save_session_state(assistant) -> None:
     """退出时持久化会话配置（当前模型档案），供下次启动恢复。"""
     try:
@@ -323,6 +338,9 @@ def run_repl(assistant) -> None:
                 continue
             if user_prompt.lower() in ["/context", "/ctx"]:
                 print("\n" + assistant.context_report())
+                continue
+            if user_prompt.lower() in ["/config", "/cfg"]:
+                print("\n" + _render_config())
                 continue
             if user_prompt.lower() in ["/expand", "/e"]:
                 expand_last_tool_output()

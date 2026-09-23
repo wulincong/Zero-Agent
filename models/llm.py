@@ -11,17 +11,19 @@ import os
 
 from langchain_openai import ChatOpenAI
 
+from core import config as _config
+
 # ----------------------------------------------------------------------
 # 通用默认参数
 # ----------------------------------------------------------------------
-DEFAULT_TEMPERATURE = 0
+DEFAULT_TEMPERATURE = _config.get_float("model.temperature", 0)
 
 # 请求超时（秒）。流式场景下 httpx 的 read 超时是"相邻两个 chunk 之间的最大间隔"，
 # 因此这里给一个较宽松的值：既能容忍长思考/长输出，又能在连接被挂起时及时失败，
 # 避免"提交后永远没返回"。
-DEFAULT_TIMEOUT = 120.0
+DEFAULT_TIMEOUT = _config.get_float("model.timeout", 120.0)
 # 失败重试次数。设为 1 表示不自动重试，避免超时场景下等待时间翻倍。
-DEFAULT_MAX_RETRIES = 1
+DEFAULT_MAX_RETRIES = _config.get_int("model.max_retries", 1)
 
 # ----------------------------------------------------------------------
 # 调用级超时（由内核的线程化调用器强制执行，独立于 httpx 的 socket 超时）
@@ -33,10 +35,10 @@ DEFAULT_MAX_RETRIES = 1
 #
 # 首字节超时：连接建立后，多久没收到任何数据就判定为挂起（秒）。
 # 可用环境变量 AGENT_FIRST_BYTE_TIMEOUT 覆盖；设为 0 表示不限制。
-FIRST_BYTE_TIMEOUT = float(os.environ.get("AGENT_FIRST_BYTE_TIMEOUT", "60")) or None
+FIRST_BYTE_TIMEOUT = _config.get_optional_float("timeout.first_byte", 60)
 # 整体超时：单次模型调用的最长等待时间（秒），兜底防止无限等待。
 # 可用环境变量 AGENT_TOTAL_TIMEOUT 覆盖；设为 0 表示不限制。
-TOTAL_TIMEOUT = float(os.environ.get("AGENT_TOTAL_TIMEOUT", "300")) or None
+TOTAL_TIMEOUT = _config.get_optional_float("timeout.total", 300)
 
 # ----------------------------------------------------------------------
 # 上下文预算（字符数，粗略按 1 token ≈ 2 字符估算）
@@ -44,9 +46,9 @@ TOTAL_TIMEOUT = float(os.environ.get("AGENT_TOTAL_TIMEOUT", "300")) or None
 # 超过该预算时，记忆层会从最旧处成组丢弃消息，避免请求超出模型上下文窗口
 # （典型报错：maximum context length is N tokens, however you requested M tokens）。
 # 可用环境变量 AGENT_CONTEXT_MAX_CHARS 覆盖；设为 0 表示不限制。
-CONTEXT_MAX_CHARS = int(os.environ.get("AGENT_CONTEXT_MAX_CHARS", "400000"))
+CONTEXT_MAX_CHARS = _config.get_int("context.max_chars", 400000)
 # 触发压缩后至少保留的最近消息条数。
-CONTEXT_KEEP_RECENT = int(os.environ.get("AGENT_CONTEXT_KEEP_RECENT", "12"))
+CONTEXT_KEEP_RECENT = _config.get_int("context.keep_recent", 12)
 
 
 # ----------------------------------------------------------------------
@@ -113,7 +115,7 @@ MODEL_PROFILES: dict[str, dict] = {
 }
 
 # 默认档案名（可用环境变量 AGENT_DEFAULT_MODEL 覆盖）
-DEFAULT_PROFILE = os.environ.get("AGENT_DEFAULT_MODEL", "deepseek")
+DEFAULT_PROFILE = _config.get_str("model.default_profile", "deepseek")
 
 # 向后兼容：旧代码可能 import 这两个常量
 DEFAULT_MODEL = MODEL_PROFILES[DEFAULT_PROFILE]["model"]

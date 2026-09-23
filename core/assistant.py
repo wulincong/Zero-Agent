@@ -45,6 +45,7 @@ RELOADABLE_MODULES = [
     # 注意：security 相关模块【故意】不在热重载名单内。
     # 安全策略只在进程冷启动时加载，任何修改都必须由用户显式重启进程才生效，
     # 防止 Agent 通过 reload_self 自行放宽/绕过自身的安全约束。
+    "core.config",
     "runtime.bash",
     "tools.builtin",
     "models.llm",
@@ -302,6 +303,9 @@ class InteractiveAssistant:
             for name in RELOADABLE_MODULES:
                 if name in sys.modules:
                     self._reload_module(sys.modules[name])
+            # 重载后强制刷新配置缓存，使 config.toml 的改动立即生效
+            if "core.config" in sys.modules:
+                sys.modules["core.config"].reload()
             mod = sys.modules["core.assistant"]
             new_cls = mod.InteractiveAssistant
             new_prompt = sys.modules["core.prompts"].SYSTEM_PROMPT

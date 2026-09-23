@@ -14,11 +14,12 @@ import subprocess
 import time
 import uuid
 
+from core import config as _config
 from runtime.interrupt import get_interrupt
 from security import Decision, check_command
 
-# 单条命令的默认超时（秒）
-DEFAULT_TIMEOUT = 180
+# 单条命令的默认超时（秒），由 config.toml 的 [shell].timeout 控制
+DEFAULT_TIMEOUT = _config.get_int("shell.timeout", 180)
 
 
 class PersistentBash:
