@@ -66,10 +66,34 @@ MODEL_PROFILES: dict[str, dict] = {
         "label": "Gemini 2.5 Flash",
     },
     "gemini-pro": {
-        "model": "gemini-2.5-pro",
+        "model": "gemini-3.1-pro-preview",
         "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
         "api_key_env": "GEMINI_API_KEY",
-        "label": "Gemini 2.5 Pro",
+        "label": "Gemini 3.1 Pro (preview)",
+    },
+    "gemini-3.8-flash": {
+        "model": "gemini-3.8-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "label": "Gemini 3.8 Flash",
+    },
+    "gemini-3.7-flash": {
+        "model": "gemini-3.7-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "label": "Gemini 3.7 Flash",
+    },
+    "gemini-3.6-flash": {
+        "model": "gemini-3.6-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "label": "Gemini 3.6 Flash",
+    },
+    "gemini-3.5-flash": {
+        "model": "gemini-3.5-flash",
+        "base_url": "https://generativelanguage.googleapis.com/v1beta/openai/",
+        "api_key_env": "GEMINI_API_KEY",
+        "label": "Gemini 3.5 Flash",
     },
 }
 
