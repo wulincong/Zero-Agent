@@ -33,15 +33,14 @@ def _mark_concurrency(tool_obj, concurrent: bool):
 def make_bash_tool(bash, on_output=None):
     """构造 run_bash 工具：在持久终端中执行命令。
 
-    阶段 2 起本工具为 async：内部用 `asyncio.to_thread` 把阻塞的
-    `bash.run(...)` 桥接到线程池，避免阻塞事件循环。
-    bash 本身仍是同步实现（唯一保留同步中断语义的模块，见 REFACTOR_PLAN 决策 1）。
+    阶段 5 起 bash 为**原生异步**实现（`asyncio.create_subprocess_exec`），
+    本工具直接 `await bash.arun(...)`，不再需要 `asyncio.to_thread` 桥接。
 
     Args:
-        bash: 持久终端实例。
+        bash: 持久终端实例（PersistentBash，提供 async arun）。
         on_output: 可选回调 on_output(command, output)，用于把命令回显与输出
             交给上层（CLI）决定如何呈现（如折叠）。为 None 时回退为直接打印。
-            注意：本回调在工作线程中被调用，实现需线程安全。
+            阶段 5 起本回调在**事件循环线程**中被调用（不再是工作线程）。
     """
 
     @tool
@@ -49,9 +48,9 @@ def make_bash_tool(bash, on_output=None):
         """在持久终端中执行 Bash 命令。环境变量和目录切换全生命周期保持生效。"""
         from runtime.interrupt import get_interrupt
 
-        # bash.run 是阻塞调用（select 轮询 + 可能的 SIGINT），放到线程池执行，
-        # 使事件循环保持可响应（Esc 中断仍由 bash 内部的 ctrl.is_set() 处理）。
-        out = await asyncio.to_thread(bash.run, command, interrupt=get_interrupt())
+        # 原生异步执行：bash.arun 内部用 asyncio 子进程 + 非阻塞读取，
+        # 事件循环在等待命令期间保持可响应（Esc 中断由 ctrl.consume() 处理）。
+        out = await bash.arun(command, interrupt=get_interrupt())
         if on_output is not None:
             on_output(command, out)
         else:

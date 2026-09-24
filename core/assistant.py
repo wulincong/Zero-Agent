@@ -109,7 +109,9 @@ class InteractiveAssistant:
         self.tools_registry = {}
         # 事件总线：内核只负责 emit，CLI/日志等外部通过 subscribe 订阅。
         # 阶段 2 起统一用 await bus.emit(...) 顺序派发；
-        # 工作线程（run_bash）产生的事件用 bus.emit_threadsafe(...) 投递回循环。
+        # 事件总线：内核只负责 emit，CLI/日志等外部通过 subscribe 订阅。
+        # 阶段 5 起 bash 为原生异步，工具事件在事件循环线程中产生；
+        # emit_threadsafe 保留以兼容可能的工作线程场景（如技能库中的阻塞调用）。
         self.bus = EventBus()
         # 常驻对话历史：首条固定为系统提示词（自我认知），后续为对话消息
         self.memory = ConversationMemory(
@@ -129,8 +131,11 @@ class InteractiveAssistant:
     # 工具注册
     # ------------------------------------------------------------------
     @staticmethod
-    def _confirm_command(cmd: str, reason: str) -> bool:
-        """终端交互确认：危险命令执行前询问用户。
+    async def _confirm_command(cmd: str, reason: str) -> bool:
+        """终端交互确认：危险命令执行前询问用户（阶段 5：异步）。
+
+        阶段 5 起 bash 为原生异步，确认流程运行在**事件循环线程**中，
+        因此本方法为 async，可直接 await 异步输入函数（无需线程桥接）。
 
         注意：确认期间必须暂停 Esc 监听线程。否则监听线程会与
         prompt_toolkit 争抢同一个 stdin，导致用户输入的 y/Enter 被
@@ -146,10 +151,9 @@ class InteractiveAssistant:
         ctrl = get_interrupt()
         ctrl.stop()
         try:
-            # 本方法运行在 run_bash 的工作线程中（无事件循环），
-            # 故使用同步版输入函数。
-            from cli.repl import _read_input_sync
-            ans = _read_input_sync("是否执行？[y/N] > ").strip().lower()
+            # 阶段 5：运行在事件循环线程中，使用异步输入函数。
+            from cli.repl import _read_input
+            ans = (await _read_input("是否执行？[y/N] > ")).strip().lower()
         except (EOFError, KeyboardInterrupt):
             return False
         finally:
@@ -175,9 +179,9 @@ class InteractiveAssistant:
         阶段 2 起统一走事件总线：内核不再持有 CLI 的临时回调，
         由 CLI 在启动时订阅 ToolResultEvent 决定如何呈现（如折叠）。
 
-        注意：本方法由 run_bash 工具在**工作线程**中调用（见 tools/builtin.py
-        的 asyncio.to_thread），因此这里不能 await，只能同步派发。
-        事件总线为此提供了线程安全的 `emit_threadsafe`。
+        阶段 5 起 bash 为原生异步，本回调在**事件循环线程**中被调用
+        （不再是工作线程），因此可直接同步派发。仍用 `emit_threadsafe`
+        以保持向后兼容（它在事件循环线程中会退化为同步派发）。
         """
         self.bus.emit_threadsafe(ToolResultEvent(
             name="run_bash", command=command, result=output,
@@ -635,7 +639,7 @@ class InteractiveAssistant:
             print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
         try:
             # 工具统一以异步方式调用：
-            # - 内置工具（run_bash 等）内部用 asyncio.to_thread 桥接阻塞 IO；
+            # - 内置工具（run_bash）为原生异步（asyncio 子进程）；
             # - 技能库纯计算函数由 langchain 的 ainvoke 在线程池中执行。
             res = await target_tool.ainvoke(fn_args)
         except _Interrupted:

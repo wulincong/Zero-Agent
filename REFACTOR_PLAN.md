@@ -15,10 +15,10 @@
 
 | 项 | 值 |
 |---|---|
-| 当前阶段 | **阶段 4 已完成，待用户验收** |
+| 当前阶段 | **阶段 5 已完成，待用户验收** |
 | 分支 | `feature/async-event-driven` |
 | 回滚锚点 | `v0.7.2-pre-async`（main 分支重构前状态） |
-| 最后更新 | 阶段 4 完成时 |
+| 最后更新 | 阶段 5 完成时 |
 
 ---
 
@@ -29,7 +29,7 @@
 - [x] **阶段 2**：内核异步化（冷重启）
 - [x] **阶段 3**：中断事件化（冷重启）
 - [x] **阶段 4**：并发工具执行
-- [ ] **阶段 5**：bash 原生异步化（独立一轮，暂不做）
+- [x] **阶段 5**：bash 原生异步化
 
 ---
 
@@ -44,7 +44,7 @@
 
 ## 进行中
 
-（无。阶段 4 已完成，等待用户验收。）
+（无。阶段 5 已完成，等待用户验收。）
 
 ### 阶段 1：事件总线（已完成）
 
@@ -221,25 +221,69 @@
 
 ---
 
-## 下一步
+## 已完成（续）
 
-**等待用户验收阶段 4。** 验收通过后进入阶段 5：
-
-### 阶段 5：bash 原生异步化（独立一轮，暂不做）
+### 阶段 5：bash 原生异步化（已完成）
 
 **目标**：把 `PersistentBash` 从"同步 + `asyncio.to_thread` 桥接"改为原生异步
 （`asyncio.create_subprocess_exec` + 非阻塞读取），彻底移除线程池依赖。
 
-**注意**：这是独立一轮的大改动，风险较高（bash 是唯一保留同步中断语义的模块），
-需单独评估后再动手。
+**改动清单（全部完成）**：
+- [x] `runtime/bash.py`：`subprocess.Popen` + `select` 轮询 → `asyncio.create_subprocess_exec`
+      + `asyncio.wait_for(reader.read(...))` 轮询；`run()` → `async def arun()`
+- [x] `runtime/bash.py`：子进程延迟到首次使用时在事件循环内创建（`_ensure_proc`）
+- [x] `runtime/bash.py`：中断检测仍用 `ctrl.consume()`，命中后 `proc.send_signal(SIGINT)`
+- [x] `runtime/bash.py`：新增 `_strip_exit_marker()`——剔除 stderr 中的 `__EXIT:N__` 行
+      （异步一次性读取会把退出码行与哨兵一起读入，需显式剔除，否则污染输出）
+- [x] `runtime/bash.py`：`_kill_proc()` 显式关闭 stdin/stdout/stderr 管道与 transport，
+      并 `await asyncio.sleep(0)`，消除事件循环关闭后的析构告警
+- [x] `runtime/bash.py`：`close()` 改 async；`_restart()` 改 async
+- [x] `tools/builtin.py`：`run_bash` 直接 `await bash.arun(...)`，移除 `asyncio.to_thread`
+- [x] `core/assistant.py`：`_confirm_command` 改 async（确认流程回到事件循环线程，
+      直接 `await _read_input(...)`，不再需要线程桥接）
+- [x] `core/assistant.py`：`_on_tool_output` 注释更新（回调现在运行在事件循环线程）
+- [x] `cli/repl.py`：`assistant.bash.close()` → `await assistant.bash.close()`
+- [x] `cli/repl.py`：删除已无调用者的 `_read_input_sync`
+- [x] 回归测试（见下）+ 打 tag `v0.7.8-bash-async`
+
+**回归测试结果（全部通过）**：
+- 单元（15/15）：基本执行 / cd 状态保持 / export 状态保持 / 无换行输出 /
+  stderr 合并 / 退出码行剔除 / 非零退出仍返回输出 / 超时触发 / 超时后会话重置 /
+  DENY 拦截 / 中断生效 / 中断后标志被消费 / 中断后会话可用 /
+  CONFIRM 异步回调被调用 / 无通道 CONFIRM 拒绝 ✅
+- 端到端（12/12，真实模型）：工具调用 / 事件含 ToolCall+ToolResult /
+  事件顺序 / 多轮上下文 / 中断返回提示 / 中断及时 / 恰好一次 InterruptEvent /
+  恰好一次 RollbackEvent / 中断后下一轮正常 / 热重载成功 / 热重载后工具可用 ✅
+- 并发（7/7）：run_bash/install_skill/reload_self 不可并发 / 两个 run_bash 串行 /
+  结果按原序回填 / 未中断 / 端到端多 bash 调用 ✅
+- 冷启动 REPL：`printf 'echo ...\nexit\n' | python Assistant.py` 正常启动、
+  工具调用、输出折叠、退出 ✅
+- `security/` 无任何改动 ✅
+
+**关键实现细节**：
+- 中断语义不变：仍是 `ctrl.consume()` 一次性消费 + SIGINT 打断前台命令。
+- 确认流程从"工作线程 + 同步输入"变为"事件循环线程 + 异步输入"，
+  因此 `_read_input_sync` 被删除。
+- `emit_threadsafe` 保留（向后兼容），但 bash 事件现在直接在循环线程产生，
+  会走其"同步派发"分支。
+- 退出码行 `__EXIT:N__` 必须显式剔除：同步版用 select 分次读取时通常不会
+  与哨兵同批到达，异步版 `read(65536)` 会一次性读入，故必须处理。
+
+---
+
+## 下一步
+
+**等待用户验收阶段 5。** 全部 5 个阶段已完成，重构收尾。
+
 
 ---
 
 ## 关键决策记录（避免重启后遗忘）
 
-1. **bash 暂不做大改动**：阶段 2 保持 `PersistentBash` 同步实现不变，
-   用 `asyncio.to_thread` 桥接到异步世界。bash 是唯一保留同步中断语义
-   （`ctrl.is_set()` + SIGINT）的模块。原生异步化留到阶段 5。
+1. **bash 异步化（阶段 5 已完成）**：`PersistentBash` 已改为原生异步
+   （`asyncio.create_subprocess_exec` + 非阻塞读取），不再依赖线程池。
+   中断语义保持：`ctrl.consume()` 一次性消费 + SIGINT 打断前台命令。
+   确认回调随之改为 async（运行在事件循环线程）。
 
 2. **工具并发**：确定要支持。工具注册需带"可并发"元数据：
    - `run_bash` / `install_skill` / `reload_self` → **不可并发**（共享 shell / 改注册表 / 改自身状态）
@@ -265,6 +309,8 @@
 - ~~阶段 3 中断竞态：事件队列里残留的旧事件在中断后需丢弃~~
   → **已解决**：引入会话代次（`new_generation` / `stamp` / `_is_stale`），
   中断后残留的旧代次事件被事件总线丢弃；中断标志改用 `consume()` 原子消费。
+- ~~bash 依赖线程池桥接（`asyncio.to_thread`），非原生异步~~
+  → **已解决**：阶段 5 改为原生 asyncio 子进程，移除线程池依赖。
 
 ---
 

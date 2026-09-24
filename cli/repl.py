@@ -283,29 +283,6 @@ def _build_session(assistant=None):
 _SESSION = None
 
 
-def _read_input_sync(prompt: str, assistant=None) -> str:
-    """同步读取用户输入（供工作线程中的确认流程使用）。
-
-    背景：危险命令的确认发生在 `run_bash` 的工作线程里（bash.run 由
-    asyncio.to_thread 执行），那里没有运行中的事件循环，无法 await。
-    因此这里提供同步版本，直接调用 prompt_toolkit 的阻塞式 prompt。
-
-    注意：调用方（_confirm_command）会先暂停 Esc 监听线程，
-    避免与 prompt_toolkit 争抢 stdin。
-    """
-    global _SESSION
-    if _SESSION is None:
-        _SESSION = _build_session(assistant)
-    if _SESSION is not None:
-        try:
-            return _SESSION.prompt(prompt, prompt_continuation="... ")
-        except EOFError:
-            raise
-        except KeyboardInterrupt:
-            return ""
-    return input(prompt)
-
-
 async def _read_input(prompt: str, assistant=None) -> str:
     """异步读取用户输入（支持多行），优先使用 prompt_toolkit。
 
@@ -373,8 +350,9 @@ async def arun_repl(assistant) -> None:
     """
     # 注册事件订阅者：内核 emit 事件，CLI 负责呈现
     register_event_subscribers(assistant)
-    # 把事件循环绑定到事件总线：run_bash 在工作线程中产生的事件
-    # 需要投递回本循环派发（见 EventBus.emit_threadsafe）
+    # 把事件循环绑定到事件总线：供 emit_threadsafe 从工作线程投递事件
+    # （阶段 5 起 bash 为原生异步，工具事件已在循环线程中产生；
+    #  绑定仍保留，以兼容技能库等可能的工作线程场景）
     try:
         assistant.bus.bind_loop(asyncio.get_running_loop())
     except Exception:
@@ -423,4 +401,4 @@ async def arun_repl(assistant) -> None:
             if getattr(assistant, "_pending_reload", False):
                 print("\n" + assistant.reload_code())
     finally:
-        assistant.bash.close()
+        await assistant.bash.close()
