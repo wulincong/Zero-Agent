@@ -20,6 +20,7 @@ from core.events import (
     ModelChunkEvent,
     ModelEndEvent,
     ModelStartEvent,
+    ModelStopEvent,
     RollbackEvent,
     ToolCallEvent,
     ToolResultEvent,
@@ -635,8 +636,6 @@ class InteractiveAssistant:
         if target_tool is None:
             return f"Error: 未找到工具 {fn_name}", False
 
-        if fn_name not in ["run_bash", "install_skill"]:
-            print(f"\n🔥 [触发已安装技能]: {fn_name}({fn_args})")
         try:
             # 工具统一以异步方式调用：
             # - 内置工具（run_bash）为原生异步（asyncio 子进程）；
@@ -659,37 +658,8 @@ class InteractiveAssistant:
 
         return res, False
 
-    @staticmethod
-    def _make_wait_notifier(threshold: float = 5.0, interval: float = 15.0):
-        """构造"仍在等待"提示回调：等待超过阈值后周期性打印一次。
-
-        目的：模型调用卡住时用户看不到任何反馈，容易误以为程序死机。
-        这里在等待期间给出明确提示（含已等待秒数与 Esc 提示），
-        让用户知道进程仍在工作、可以按 Esc 中断。
-
-        Args:
-            threshold: 首次提示的等待秒数（默认 5s）。
-            interval: 之后每隔多少秒再提示一次（默认 15s）。
-
-        Returns:
-            回调 on_wait(elapsed)，可安全传入异步等待循环。
-        """
-        state = {"next": threshold}
-
-        def on_wait(elapsed: float) -> None:
-            if elapsed >= state["next"]:
-                print(
-                    f"\n⏳ 模型仍在响应中…（已等待 {elapsed:.0f}s，"
-                    f"按 Esc 可中断）",
-                    flush=True,
-                )
-                state["next"] = elapsed + interval
-
-        return on_wait
-
     async def _await_with_interrupt(self, coro, ctrl, *, first_byte_timeout=None,
-                                    total_timeout=None, on_wait=None,
-                                    first_byte_flag=None):
+                                    total_timeout=None, first_byte_flag=None):
         """在异步上下文中等待一个协程，同时支持 Esc 中断与超时。
 
         阶段 2 用原生 asyncio 取代了旧的线程化调用器（_run_interruptible）：
@@ -702,7 +672,6 @@ class InteractiveAssistant:
             ctrl: 中断控制器（提供 is_set()）。
             first_byte_timeout: 首个数据到达前的最大等待秒数（None 表示不限）。
             total_timeout: 整体最大等待秒数（None 表示不限）。
-            on_wait: 可选回调 on_wait(elapsed)，等待期间周期性调用。
             first_byte_flag: 可选单元素列表（如 [False]），由被等待的协程在
                 收到首个数据时置为 True，用于实现首字节超时判定。
 
@@ -737,11 +706,6 @@ class InteractiveAssistant:
                     task.cancel()
                     await asyncio.gather(task, return_exceptions=True)
                     return "timeout", f"连接后 {first_byte_timeout:g}s 内未收到任何数据"
-                if on_wait is not None:
-                    try:
-                        on_wait(elapsed)
-                    except Exception:
-                        pass
                 # 等待 task 完成或 50ms 超时（用于轮询中断/超时）
                 await asyncio.wait({task}, timeout=0.05)
         except asyncio.CancelledError:
@@ -777,63 +741,71 @@ class InteractiveAssistant:
 
         state = {"aggregated": None, "chunks": 0}
         first_flag = [False]
-        on_wait = self._make_wait_notifier()
 
         await self.bus.emit(ModelStartEvent())
+        ok = False
+        try:
+            async def _consume():
+                """消费异步流，逐 chunk 聚合，并发布流式事件。"""
+                async for chunk in self.model.astream(self.memory.messages):
+                    first_flag[0] = True
+                    state["chunks"] += 1
+                    # 工具调用流式：工具名一出现就通知（参数逐字符生成，此处不通知）
+                    if getattr(chunk, "tool_call_chunks", None):
+                        for tc in chunk.tool_call_chunks:
+                            if tc.get("name"):
+                                await self.bus.emit(ToolCallEvent(name=tc["name"]))
+                    # 文本增量事件（供需要实时渲染的订阅者使用）
+                    text = getattr(chunk, "content", "") or ""
+                    if isinstance(text, str) and text:
+                        await self.bus.emit(ModelChunkEvent(text=text))
+                    agg = state["aggregated"]
+                    state["aggregated"] = chunk if agg is None else agg + chunk
+                return state["aggregated"]
 
-        async def _consume():
-            """消费异步流，逐 chunk 聚合，并发布流式事件。"""
-            async for chunk in self.model.astream(self.memory.messages):
-                first_flag[0] = True
-                state["chunks"] += 1
-                # 工具调用流式：工具名一出现就通知（参数逐字符生成，此处不通知）
-                if getattr(chunk, "tool_call_chunks", None):
-                    for tc in chunk.tool_call_chunks:
-                        if tc.get("name"):
-                            await self.bus.emit(ToolCallEvent(name=tc["name"]))
-                # 文本增量事件（供需要实时渲染的订阅者使用）
-                text = getattr(chunk, "content", "") or ""
-                if isinstance(text, str) and text:
-                    await self.bus.emit(ModelChunkEvent(text=text))
-                agg = state["aggregated"]
-                state["aggregated"] = chunk if agg is None else agg + chunk
-            return state["aggregated"]
-
-        status, value = await self._await_with_interrupt(
-            _consume(), ctrl,
-            first_byte_timeout=first_byte_timeout,
-            total_timeout=total_timeout,
-            on_wait=on_wait,
-            first_byte_flag=first_flag,
-        )
-
-        if status == "interrupted":
-            # 中断事件统一由 _rollback 发布（避免重复）
-            return None
-        if status == "timeout":
-            raise TimeoutError(
-                f"模型调用超时（{value}）。可能是网络不通、服务端无响应或"
-                f"请求过大。已放弃等待，可重试或切换模型（/model）。"
+            status, value = await self._await_with_interrupt(
+                _consume(), ctrl,
+                first_byte_timeout=first_byte_timeout,
+                total_timeout=total_timeout,
+                first_byte_flag=first_flag,
             )
-        if status == "error":
-            e = value
-            # 中断优先：用户已按 Esc 时直接返回，不再重发请求。
-            if ctrl.is_set():
-                return None
-            # 仅在"尚未收到任何 chunk"时才回退到一次性调用（兼容不支持流式的供应商）。
-            # 若已经收到部分 chunk 再失败，重发会导致重复计费/重复输出，故直接抛出。
-            if state["chunks"] == 0 and not _is_timeout_error(e):
-                return await self._ainvoke_model(ctrl)
-            raise e
 
-        if value is None:
-            # 流式未产出任何内容（部分供应商对空响应如此表现），回退一次性调用
-            return await self._ainvoke_model(ctrl)
-        # 聚合结果已是 AIMessageChunk，转换为 AIMessage 语义一致
-        return value
+            if status == "interrupted":
+                # 中断事件统一由 _rollback 发布（避免重复）
+                return None
+            if status == "timeout":
+                raise TimeoutError(
+                    f"模型调用超时（{value}）。可能是网络不通、服务端无响应或"
+                    f"请求过大。已放弃等待，可重试或切换模型（/model）。"
+                )
+            if status == "error":
+                e = value
+                # 中断优先：用户已按 Esc 时直接返回，不再重发请求。
+                if ctrl.is_set():
+                    return None
+                # 仅在"尚未收到任何 chunk"时才回退到一次性调用（兼容不支持流式的供应商）。
+                # 若已经收到部分 chunk 再失败，重发会导致重复计费/重复输出，故直接抛出。
+                if state["chunks"] == 0 and not _is_timeout_error(e):
+                    return await self._ainvoke_model(ctrl)
+                raise e
+
+            if value is None:
+                # 流式未产出任何内容（部分供应商对空响应如此表现），回退一次性调用
+                return await self._ainvoke_model(ctrl)
+            # 聚合结果已是 AIMessageChunk，转换为 AIMessage 语义一致
+            ok = True
+            return value
+        finally:
+            # 兜底信号：无论成功/中断/超时/异常，都通知订阅者"模型阶段结束"，
+            # 避免 CLI 的等待指示器残留转圈动画。
+            await self.bus.emit(ModelStopEvent(ok=ok))
 
     async def _ainvoke_model(self, ctrl):
-        """非流式兜底调用（原生异步，同样可中断、可超时）。"""
+        """非流式兜底调用（原生异步，同样可中断、可超时）。
+
+        与 _astream_model 一样成对 emit ModelStartEvent / ModelStopEvent，
+        使 CLI 的等待指示器在回退路径上也能正确重启与停止。
+        """
         first_flag = [False]
 
         async def _do_invoke():
@@ -841,23 +813,28 @@ class InteractiveAssistant:
             first_flag[0] = True
             return result
 
-        status, value = await self._await_with_interrupt(
-            _do_invoke(), ctrl,
-            first_byte_timeout=_models.FIRST_BYTE_TIMEOUT,
-            total_timeout=_models.TOTAL_TIMEOUT,
-            on_wait=self._make_wait_notifier(),
-            first_byte_flag=first_flag,
-        )
-        if status == "interrupted":
-            # 中断事件统一由 _rollback 发布（避免重复）
-            return None
-        if status == "timeout":
-            raise TimeoutError(
-                f"模型调用超时（{value}）。已放弃等待，可重试或切换模型（/model）。"
+        await self.bus.emit(ModelStartEvent())
+        ok = False
+        try:
+            status, value = await self._await_with_interrupt(
+                _do_invoke(), ctrl,
+                first_byte_timeout=_models.FIRST_BYTE_TIMEOUT,
+                total_timeout=_models.TOTAL_TIMEOUT,
+                first_byte_flag=first_flag,
             )
-        if status == "error":
-            raise value
-        return value
+            if status == "interrupted":
+                # 中断事件统一由 _rollback 发布（避免重复）
+                return None
+            if status == "timeout":
+                raise TimeoutError(
+                    f"模型调用超时（{value}）。已放弃等待，可重试或切换模型（/model）。"
+                )
+            if status == "error":
+                raise value
+            ok = True
+            return value
+        finally:
+            await self.bus.emit(ModelStopEvent(ok=ok))
 
     async def _rollback(self, start_len: int, stage: str = "") -> None:
         """回滚本轮对话产生的消息，保证历史一致（不残留残缺 tool_call）。"""

@@ -9,6 +9,7 @@
 
 import asyncio
 import sys
+import time
 
 # ----------------------------------------------------------------------
 # 输出后端：优先 rich 渲染 Markdown，失败则降级为纯文本
@@ -69,6 +70,95 @@ def render_markdown(text: str, prefix: str = "🤖 Agent > ") -> None:
         print(f"\n{prefix}\n{text}")
 
 
+class ModelSpinner:
+    """模型等待指示器：转圈动画 + 实时读秒（仅 TTY 下启用）。
+
+    呈现形式（全程读秒）：
+      - 模型开始响应（ModelStartEvent）后，在**同一行**原地刷新
+        `⠋ 思考中 3.2s`，转圈字符每 80ms 变一次，秒数实时递增；
+      - **全程读秒**：模型吐字（ModelChunkEvent）时**不停止**转圈，
+        继续计时，直到模型阶段结束（ModelStopEvent）才停止，
+        并把该行定格为 `✓ 用时 3.2s`（保留一行历史）；
+      - 非 TTY 环境（管道/重定向）完全静默，不输出任何字符（Q3(a)）。
+
+    计时起点为 ModelStartEvent（Q4），即请求发出时刻。
+
+    实现：用一个后台 asyncio 任务周期性重绘；所有输出走 sys.stdout.write
+    配合 `\r` 覆盖，避免与 rich 的 Markdown 渲染互相干扰。
+    """
+
+    _FRAMES = "⠋⠙⠹⠸⠼⠴⠦⠧⠇⠏"
+    _INTERVAL = 0.08  # 重绘周期（秒）
+
+    def __init__(self):
+        self._task = None
+        self._start = 0.0
+        self._active = False
+        self._paused = False  # 暂停期间不重绘（供打印其它内容时让出当前行）
+        self._enabled = sys.stdout.isatty()
+
+    # -- 生命周期 ------------------------------------------------------
+    def start(self) -> None:
+        """模型开始响应：启动转圈任务。"""
+        if not self._enabled or self._active:
+            return
+        self._active = True
+        self._paused = False
+        self._start = time.monotonic()
+        self._task = asyncio.ensure_future(self._spin())
+
+    def stop(self) -> None:
+        """模型阶段结束：停止转圈并定格用时行（全程读秒，吐字时不停止）。"""
+        if not self._active:
+            return
+        self._active = False
+        self._paused = False
+        if self._task is not None:
+            self._task.cancel()
+            self._task = None
+        elapsed = time.monotonic() - self._start
+        if self._enabled:
+            # 清除转圈行，改写为定格的用时行
+            sys.stdout.write("\r\033[K")
+            sys.stdout.write(f"✓ 用时 {elapsed:.1f}s\n")
+            sys.stdout.flush()
+
+    def pause(self) -> None:
+        """暂停重绘并清除当前转圈行，让出终端当前行给其它输出。
+
+        用于流式过程中需要打印内容（如工具调用提示）的场景：
+        先清除转圈行，打印完再 resume() 继续计时（计时不重置）。
+        """
+        if not self._active or self._paused:
+            return
+        self._paused = True
+        if self._enabled:
+            sys.stdout.write("\r\033[K")
+            sys.stdout.flush()
+
+    def resume(self) -> None:
+        """恢复重绘（计时延续，不重置起点）。"""
+        if not self._active or not self._paused:
+            return
+        self._paused = False
+
+    # -- 内部 ----------------------------------------------------------
+    async def _spin(self) -> None:
+        """后台任务：周期性原地重绘 `⠋ 思考中 X.Xs`（暂停期间跳过重绘）。"""
+        i = 0
+        try:
+            while True:
+                if not self._paused:
+                    elapsed = time.monotonic() - self._start
+                    frame = self._FRAMES[i % len(self._FRAMES)]
+                    sys.stdout.write(f"\r\033[K{frame} 思考中 {elapsed:.1f}s")
+                    sys.stdout.flush()
+                    i += 1
+                await asyncio.sleep(self._INTERVAL)
+        except asyncio.CancelledError:
+            pass
+
+
 def make_tool_call_printer():
     """构造工具调用流式提示回调。
 
@@ -115,19 +205,50 @@ def register_event_subscribers(assistant) -> None:
     阶段 2 起内核已移除 on_tool_call / on_tool_output 回调参数，
     所有呈现统一走事件总线，因此这里注册的订阅者是唯一的呈现路径。
     """
-    from core.events import ToolCallEvent, ToolResultEvent
+    from core.events import (
+        ModelChunkEvent,
+        ModelStartEvent,
+        ModelStopEvent,
+        ToolCallEvent,
+        ToolResultEvent,
+    )
 
     printer = make_tool_call_printer()
     folder = make_tool_output_handler()
+    spinner = ModelSpinner()
 
     def _on_tool_call(event) -> None:
-        printer(event.name, event.args)
+        # 打印前让出转圈行，打印后恢复（计时延续），避免与转圈行混排
+        spinner.pause()
+        try:
+            printer(event.name, event.args)
+        finally:
+            spinner.resume()
 
     def _on_tool_result(event) -> None:
-        folder(event.command, event.result)
+        spinner.pause()
+        try:
+            folder(event.command, event.result)
+        finally:
+            spinner.resume()
+
+    def _on_model_start(event) -> None:
+        spinner.start()
+
+    def _on_model_chunk(event) -> None:
+        # 全程读秒：模型吐字时不停止转圈，继续计时到模型阶段结束。
+        # （保留订阅以便将来需要"首 token 到达"信号时使用，此处不动作。）
+        pass
+
+    def _on_model_stop(event) -> None:
+        # 唯一停止点：无论成功/中断/超时/异常都会收到，定格用时行。
+        spinner.stop()
 
     assistant.bus.subscribe(ToolCallEvent, _on_tool_call)
     assistant.bus.subscribe(ToolResultEvent, _on_tool_result)
+    assistant.bus.subscribe(ModelStartEvent, _on_model_start)
+    assistant.bus.subscribe(ModelChunkEvent, _on_model_chunk)
+    assistant.bus.subscribe(ModelStopEvent, _on_model_stop)
 
 
 def expand_last_tool_output() -> None:
@@ -162,8 +283,9 @@ HELP_TEXT = """\
    Esc            中断当前操作（模型调用/命令执行），回到对话
    Ctrl+C         清空当前输入行
 
-⏱️  超时保护：
-   模型调用若长时间无响应，会周期性提示"仍在响应中"；
+⏱️  等待与超时：
+   模型响应期间会显示转圈动画与实时读秒（如 ⠋ 思考中 3.2s），
+   首个 token 到达后定格为"✓ 用时 X.Xs"；
    超过首字节超时（默认 60s）或整体超时（默认 300s）会自动放弃并报错，
    不会无限卡死。可在 config.toml 的 [timeout] 段调整。"""
 

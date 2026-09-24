@@ -89,6 +89,23 @@ class ModelEndEvent(Event):
 
 
 @dataclass
+class ModelStopEvent(Event):
+    """模型阶段结束（无论成功、失败、中断还是超时）。
+
+    与 ModelEndEvent 的区别：
+      - ModelEndEvent 表示"成功拿到完整响应"，携带 message，仅在成功路径 emit；
+      - ModelStopEvent 是**兜底信号**，在模型调用的 finally 中 emit，
+        保证订阅者（如 CLI 的等待指示器）无论走哪条路径都能收到"结束"通知，
+        不会因中断/超时/异常而残留转圈动画。
+
+    Attributes:
+        ok: 是否成功完成（False 表示中断/超时/异常）。
+    """
+
+    ok: bool = True
+
+
+@dataclass
 class ToolCallEvent(Event):
     """模型决定调用某个工具。
 
